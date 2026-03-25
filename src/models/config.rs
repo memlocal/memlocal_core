@@ -50,7 +50,7 @@ impl Default for StorageConfig {
             hnsw_ef_construction: 100,
             embedding_dimensions: 1536,
             min_confidence_to_store: 0.3,
-            enable_time_decay: false,
+            enable_time_decay: true,
         }
     }
 }

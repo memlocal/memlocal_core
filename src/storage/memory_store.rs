@@ -122,13 +122,14 @@ impl MemoryStore {
             .map(|&f| DataValue::from(f as f64))
             .collect();
 
+        // v4: Use ASSERT validity for time-travel support
         let script = format!(
-            "?[id, content, type, hash, user_id, agent_id, session_id, \
-             metadata_json, embedding, created_at, updated_at, valid_at, invalid_at] <- \
-             [[$id, $content, $type, $hash, $user_id, $agent_id, $session_id, \
-             $metadata_json, vec($embedding), $created_at, $updated_at, $valid_at, $invalid_at]]\n\
-             :put {} {{id, content, type, hash, user_id, agent_id, session_id, \
-             metadata_json, embedding, created_at, updated_at, valid_at, invalid_at}}",
+            "?[id, vld, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, embedding, created_at, updated_at, event_start, event_end] <- \
+             [[$id, 'ASSERT', $content, $type, $hash, $user_id, $agent_id, $session_id, \
+             $metadata_json, vec($embedding), $created_at, $updated_at, $event_start, $event_end]]\n\
+             :put {} {{id, vld => content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, embedding, created_at, updated_at, event_start, event_end}}",
             MemorySchema::MEMORIES
         );
 
@@ -166,11 +167,11 @@ impl MemoryStore {
                 DataValue::from(m["updated_at"].as_f64().unwrap_or(0.0)),
             ),
             (
-                "valid_at".into(),
+                "event_start".into(),
                 DataValue::from(m["valid_at"].as_f64().unwrap_or(0.0)),
             ),
             (
-                "invalid_at".into(),
+                "event_end".into(),
                 DataValue::from(m["invalid_at"].as_f64().unwrap_or(0.0)),
             ),
         ]);
@@ -187,13 +188,14 @@ impl MemoryStore {
         Ok(())
     }
 
-    /// Get a memory item by ID.
+    /// Get a memory item by ID (current version via time-travel).
     pub fn get_memory(&self, id: &str) -> Result<Option<MemoryItem>> {
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              *{}{{id, content, type, hash, user_id, agent_id, session_id, \
-             metadata_json, created_at, updated_at, valid_at, invalid_at}}, id == $id",
+             metadata_json, created_at, updated_at, \
+             event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}, id == $id",
             MemorySchema::MEMORIES
         );
         let params = BTreeMap::from([("id".into(), DataValue::Str(id.into()))]);
@@ -213,9 +215,11 @@ impl MemoryStore {
         memory_type: Option<MemoryType>,
         limit: usize,
     ) -> Result<Vec<MemoryItem>> {
+        // v4: Use @ "NOW" time-travel instead of invalid_at == 0.0 filter
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
-             metadata_json, created_at, updated_at, valid_at, invalid_at}}",
+             metadata_json, created_at, updated_at, \
+             event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
         )];
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
@@ -228,7 +232,6 @@ impl MemoryStore {
             conditions.push("type == $mtype".into());
             params.insert("mtype".into(), DataValue::Str(mtype.stored_name().into()));
         }
-        conditions.push("invalid_at == 0.0".into());
 
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
@@ -242,13 +245,19 @@ impl MemoryStore {
         rows_to_items(&result)
     }
 
-    /// Invalidate (soft-delete) a memory.
+    /// Invalidate (soft-delete) a memory using RETRACT validity.
+    /// The memory's history is preserved — it just becomes invisible at "NOW".
     pub fn invalidate_memory(&self, id: &str) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        // RETRACT requires all value columns. Get current values, then retract.
         let script = format!(
-            "?[id, invalid_at] <- [[$id, {now}]]\n\
-             :update {} {{id => invalid_at}}",
-            MemorySchema::MEMORIES
+            "?[id, vld, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, embedding, created_at, updated_at, event_start, event_end] := \
+             *{rel}{{id, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, embedding, created_at, updated_at, event_start, event_end, @ \"NOW\"}}, \
+             id == $id, vld = 'RETRACT'\n\
+             :put {rel} {{id, vld => content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, embedding, created_at, updated_at, event_start, event_end}}",
+            rel = MemorySchema::MEMORIES
         );
         let params = BTreeMap::from([("id".into(), DataValue::Str(id.into()))]);
         self.run_mutable(&script, params)?;
@@ -256,25 +265,23 @@ impl MemoryStore {
     }
 
     /// Hard-delete a memory by ID.
+    /// Hard-delete uses RETRACT with Validity (preserves history but invisible at NOW).
     pub fn delete_memory(&self, id: &str) -> Result<()> {
-        let script = format!("?[id] <- [[$id]]\n:rm {} {{id}}", MemorySchema::MEMORIES);
-        let params = BTreeMap::from([("id".into(), DataValue::Str(id.into()))]);
-        self.run_mutable(&script, params)?;
-        Ok(())
+        self.invalidate_memory(id)
     }
 
     /// Find existing memories that match by content hash (dedup check).
     pub fn find_by_hash(&self, hash: &str, user_id: Option<&str>) -> Result<Option<MemoryItem>> {
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
-             metadata_json, created_at, updated_at, valid_at, invalid_at}}",
+             metadata_json, created_at, updated_at, \
+             event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
         )];
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
 
         conditions.push("hash == $h".into());
         params.insert("h".into(), DataValue::Str(hash.into()));
-        conditions.push("invalid_at == 0.0".into());
 
         if let Some(uid) = user_id {
             conditions.push("user_id == $uid".into());
@@ -296,9 +303,12 @@ impl MemoryStore {
         Ok(Some(MemoryItem::from_map(&map)?))
     }
 
-    /// Count total memories.
+    /// Count total memories (current versions only via time-travel).
     pub fn memory_count(&self, memory_type: Option<MemoryType>) -> Result<usize> {
-        let mut conditions = vec![format!("*{}{{id, type}}", MemorySchema::MEMORIES)];
+        let mut conditions = vec![format!(
+            "*{}{{id, type, @ \"NOW\"}}",
+            MemorySchema::MEMORIES
+        )];
         let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
 
         if let Some(mtype) = memory_type {
@@ -326,13 +336,23 @@ impl MemoryStore {
         raw_score * confidence.sqrt()
     }
 
-    /// Compute exponential time-decay factor. lambda=0.005, half-life ~138 days.
+    /// v5: Type-aware time decay factor.
+    /// - Factual/semantic: low decay (lambda=0.002, half-life ~346 days) — facts persist
+    /// - Episodic: medium decay (lambda=0.005, half-life ~138 days) — events age
+    /// - Prospective: high decay (lambda=0.02, half-life ~35 days) — reminders expire fast
     fn time_decay_factor(&self, item: &MemoryItem) -> f64 {
         if !self.enable_time_decay {
             return 1.0;
         }
         let days_since = (chrono::Utc::now() - item.updated_at).num_days() as f64;
-        (-0.005 * days_since).exp()
+        let lambda = match item.memory_type {
+            MemoryType::Factual | MemoryType::Semantic | MemoryType::Procedural => 0.002,
+            MemoryType::Social => 0.003,
+            MemoryType::Episodic | MemoryType::Spatial | MemoryType::Affective => 0.005,
+            MemoryType::Prospective => 0.02,
+            _ => 0.005,
+        };
+        (-lambda * days_since).exp()
     }
 
     /// Compute importance: 0.3*confidence + 0.3*log_access + 0.4*recency.
@@ -372,15 +392,28 @@ impl MemoryStore {
         if let Some(mtype) = memory_type {
             filter_parts.push(format!("type == \"{}\"", mtype.stored_name()));
         }
-        filter_parts.push("invalid_at == 0.0".into());
-        let filter = filter_parts.join(" && ");
+        // Note: with Validity schema, HNSW indexes all versions.
+        // We still filter by user_id/type if specified.
+        let filter = if filter_parts.is_empty() {
+            String::new()
+        } else {
+            filter_parts.join(" && ")
+        };
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
-                           metadata_json, created_at, updated_at, valid_at, invalid_at";
+                           metadata_json, created_at, updated_at, \
+                           event_start: valid_at, event_end: invalid_at";
+        let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             metadata_json, created_at, updated_at, valid_at, invalid_at";
 
+        let filter_clause = if filter.is_empty() {
+            String::new()
+        } else {
+            format!(", filter: {filter}")
+        };
         let script = format!(
-            "?[{bind_fields}, distance] := ~{}:{}{{ {bind_fields} | \
-             query: vec($q), k: {k}, ef: {ef}, bind_distance: distance, filter: {filter} }}",
+            "?[{output_fields}, distance] := ~{}:{}{{ {bind_fields} | \
+             query: vec($q), k: {k}, ef: {ef}, bind_distance: distance{filter_clause} }}",
             MemorySchema::MEMORIES,
             MemorySchema::VECTOR_INDEX,
             ef = k * 2,
@@ -412,10 +445,13 @@ impl MemoryStore {
         }
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
-                           metadata_json, created_at, updated_at, valid_at, invalid_at";
+                           metadata_json, created_at, updated_at, \
+                           event_start: valid_at, event_end: invalid_at";
+        let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             metadata_json, created_at, updated_at, valid_at, invalid_at";
 
         let script = format!(
-            "?[{bind_fields}, score] := ~{}:{}{{ {bind_fields} | \
+            "?[{output_fields}, score] := ~{}:{}{{ {bind_fields} | \
              query: $q, k: {k}, bind_score: score }}",
             MemorySchema::MEMORIES,
             MemorySchema::FTS_INDEX,
@@ -442,10 +478,13 @@ impl MemoryStore {
         }
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
-                           metadata_json, created_at, updated_at, valid_at, invalid_at";
+                           metadata_json, created_at, updated_at, \
+                           event_start: valid_at, event_end: invalid_at";
+        let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             metadata_json, created_at, updated_at, valid_at, invalid_at";
 
         let script = format!(
-            "?[{bind_fields}, score] := ~{}:{}{{ {bind_fields} | \
+            "?[{output_fields}, score] := ~{}:{}{{ {bind_fields} | \
              query: $q, k: {k}, bind_score: score }}",
             MemorySchema::MEMORIES,
             MemorySchema::LSH_INDEX,
@@ -498,13 +537,14 @@ impl MemoryStore {
         add_ranks(&text_list);
         add_ranks(&lsh_list);
 
-        // Apply time decay
+        // Apply time decay + confidence boost to RRF scores
         let mut final_scores: Vec<(String, f64)> = rrf_scores
             .into_iter()
             .map(|(id, score)| {
                 let item = &item_map[&id];
                 let decayed = score * self.time_decay_factor(item);
-                (id, decayed)
+                let with_confidence = Self::apply_confidence(item, decayed);
+                (id, with_confidence)
             })
             .collect();
 
@@ -515,6 +555,45 @@ impl MemoryStore {
             .take(k)
             .filter_map(|(id, score)| item_map.remove(&id).map(|item| item.with_score(score)))
             .collect())
+    }
+
+    /// v5: Hybrid search with post-search dedup by recency.
+    /// Fetches top-30, clusters by similarity, keeps newest per cluster, returns top-k.
+    /// This prevents Claude from seeing conflicting versions of the same fact.
+    pub fn search_hybrid_deduped(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        k: usize,
+        user_id: Option<&str>,
+        memory_type: Option<MemoryType>,
+    ) -> Result<Vec<MemoryItem>> {
+        // Fetch more than needed for dedup headroom
+        let raw = self.search_hybrid(query, query_embedding, k + 15, user_id, memory_type)?;
+
+        if raw.len() <= 1 {
+            return Ok(raw);
+        }
+
+        // Cluster by content similarity: if two results share >60% words, they're about the same topic
+        let mut kept: Vec<MemoryItem> = Vec::new();
+        for item in raw {
+            let dominated = kept.iter().any(|existing| {
+                word_overlap(&existing.content, &item.content) > 0.6
+                    && existing.updated_at >= item.updated_at
+            });
+            if !dominated {
+                // Remove any older item this one dominates
+                kept.retain(|existing| {
+                    !(word_overlap(&existing.content, &item.content) > 0.6
+                        && item.updated_at > existing.updated_at)
+                });
+                kept.push(item);
+            }
+        }
+
+        kept.truncate(k);
+        Ok(kept)
     }
 
     /// Graph search: seeds from semantic, then traverses edges.
@@ -1065,9 +1144,36 @@ impl MemoryStore {
         }
         Ok(serde_json::Value::Object(export))
     }
+
+    /// Compact the database for optimal query performance.
+    /// Call after bulk operations (storing many memories).
+    pub fn compact(&self) -> Result<()> {
+        self.try_run(MemorySchema::compact_statement());
+        Ok(())
+    }
 }
 
 // ──────────── Helpers ────────────
+
+/// Jaccard-like word overlap ratio between two strings.
+fn word_overlap(a: &str, b: &str) -> f64 {
+    let words_a: std::collections::HashSet<&str> = a
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| w.len() > 2)
+        .collect();
+    let words_b: std::collections::HashSet<&str> = b
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| w.len() > 2)
+        .collect();
+    if words_a.is_empty() || words_b.is_empty() {
+        return 0.0;
+    }
+    let intersection = words_a.intersection(&words_b).count();
+    let smaller = words_a.len().min(words_b.len());
+    intersection as f64 / smaller as f64
+}
 
 fn sanitize_fts_query(query: &str) -> String {
     query

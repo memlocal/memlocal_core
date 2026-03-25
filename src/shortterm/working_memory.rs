@@ -163,7 +163,9 @@ impl WorkingMemory {
                         Some(s) => format!(" (relevance: {s:.2})"),
                         None => String::new(),
                     };
-                    buf.push_str(&format!("  - {}{}\n", item.content, score_str));
+                    // v5: Add recency annotation so Claude prefers recent info
+                    let age = format_age(item.updated_at);
+                    buf.push_str(&format!("  - [{age}] {}{}\n", item.content, score_str));
                 }
             }
             buf.push('\n');
@@ -188,5 +190,23 @@ impl WorkingMemory {
 impl Default for WorkingMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Format how old a memory is in human-readable form.
+fn format_age(updated_at: chrono::DateTime<chrono::Utc>) -> String {
+    let days = (chrono::Utc::now() - updated_at).num_days();
+    if days == 0 {
+        "today".to_string()
+    } else if days == 1 {
+        "1 day ago".to_string()
+    } else if days < 7 {
+        format!("{days} days ago")
+    } else if days < 30 {
+        format!("{} weeks ago", days / 7)
+    } else if days < 365 {
+        format!("{} months ago", days / 30)
+    } else {
+        format!("{} years ago", days / 365)
     }
 }

@@ -11,6 +11,7 @@ pub mod tool_names {
     pub const GET_RELATIONSHIPS: &str = "get_relationships";
     pub const ADD_REMINDER: &str = "add_reminder";
     pub const GET_CONTEXT: &str = "get_context";
+    pub const ADD_MEMORIES: &str = "add_memories";
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -222,6 +223,28 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: tool_names::ADD_MEMORIES.into(),
+            description: "Extract and store memories from raw conversation text. \
+                Automatically classifies memory types, assigns confidence scores, \
+                and resolves temporal references to absolute dates. \
+                Use this instead of add_memory when processing natural conversation."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Raw conversation text to extract memories from."
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Optional user identifier."
+                    }
+                },
+                "required": ["text"]
             }),
         },
     ]

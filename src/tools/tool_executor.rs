@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::prompts::{self, TemporalContext};
 use super::tool_definitions::tool_names;
 use crate::error::{MemlocalError, Result};
 use crate::models::*;
@@ -12,6 +13,12 @@ use crate::storage::MemoryStore;
 /// Trait for embedding generation — implemented by the platform layer.
 pub trait EmbeddingProvider: Send + Sync {
     fn embed_one(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+/// Trait for LLM completions — used by `add_memories` for extraction/classification.
+/// Platform layers implement this with their HTTP client (Anthropic, OpenAI, etc.).
+pub trait LlmProvider: Send + Sync {
+    fn complete(&self, system: &str, user: &str) -> Result<String>;
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -30,6 +37,37 @@ pub struct ToolResult {
     pub success: bool,
 }
 
+/// Optional providers passed to `execute`. Only `add_memories` needs the LLM provider.
+pub struct ExecutionContext<'a> {
+    pub embedding_provider: &'a dyn EmbeddingProvider,
+    pub llm_provider: Option<&'a dyn LlmProvider>,
+    pub temporal: Option<&'a TemporalContext>,
+}
+
+impl<'a> ExecutionContext<'a> {
+    /// Minimal context (no LLM, no temporal) — sufficient for all tools except `add_memories`.
+    pub fn new(embedding_provider: &'a dyn EmbeddingProvider) -> Self {
+        Self {
+            embedding_provider,
+            llm_provider: None,
+            temporal: None,
+        }
+    }
+
+    /// Full context with LLM + temporal — required for `add_memories`.
+    pub fn full(
+        embedding_provider: &'a dyn EmbeddingProvider,
+        llm_provider: &'a dyn LlmProvider,
+        temporal: &'a TemporalContext,
+    ) -> Self {
+        Self {
+            embedding_provider,
+            llm_provider: Some(llm_provider),
+            temporal: Some(temporal),
+        }
+    }
+}
+
 pub struct ToolExecutor {
     store: Arc<MemoryStore>,
 }
@@ -39,14 +77,88 @@ impl ToolExecutor {
         Self { store }
     }
 
-    /// Execute a single tool call.
+    /// Pre-compute context for a user query BEFORE sending to the LLM.
+    ///
+    /// This is the key latency optimization: instead of Claude making tool calls
+    /// (each costing an LLM round-trip), we fetch relevant context upfront and
+    /// inject it into the system prompt. Most questions can then be answered
+    /// in a single LLM call.
+    ///
+    /// Returns a formatted context block ready for system prompt injection.
+    pub fn prepare_context(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        user_id: Option<&str>,
+    ) -> Result<String> {
+        // v5: Query decomposition — split multi-topic queries and search each
+        let sub_queries = decompose_query(query);
+        let mut all_memories = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        for sq in &sub_queries {
+            let emb = embedding_provider.embed_one(sq)?;
+            // v5: Use deduped search to avoid conflicting versions
+            let results = self
+                .store
+                .search_hybrid_deduped(sq, &emb, 15, user_id, None)?;
+            for item in results {
+                if seen_ids.insert(item.id.clone()) {
+                    all_memories.push(item);
+                }
+            }
+        }
+
+        // Sort by score descending, keep top 20
+        all_memories.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_memories.truncate(20);
+
+        // Get user profile
+        let profile = match user_id {
+            Some(uid) => self.store.get_profile(uid)?,
+            None => None,
+        };
+
+        // Get pending reminders
+        let prospective = self
+            .store
+            .get_pending_prospective(user_id)
+            .unwrap_or_default();
+
+        // Get important memories
+        let important = self
+            .store
+            .get_important_memories(user_id, 5, 0.6)
+            .unwrap_or_default();
+
+        // Assemble using WorkingMemory
+        let mut wm = crate::shortterm::WorkingMemory::new();
+        wm.set_relevant(all_memories);
+        wm.set_important(important);
+        wm.set_profile(profile);
+        wm.set_triggered_reminders(prospective);
+
+        Ok(wm.to_context_block())
+    }
+
+    /// Execute a single tool call (backward-compatible — no LLM/temporal).
     pub fn execute(
         &self,
         tool_call: &ToolCall,
         embedding_provider: &dyn EmbeddingProvider,
     ) -> ToolResult {
+        let ctx = ExecutionContext::new(embedding_provider);
+        self.execute_with_context(tool_call, &ctx)
+    }
+
+    /// Execute a single tool call with full context (LLM + temporal).
+    pub fn execute_with_context(&self, tool_call: &ToolCall, ctx: &ExecutionContext) -> ToolResult {
         let start = std::time::Instant::now();
-        let result = self.dispatch(&tool_call.name, &tool_call.arguments, embedding_provider);
+        let result = self.dispatch(&tool_call.name, &tool_call.arguments, ctx);
         let duration_ms = start.elapsed().as_millis() as u64;
 
         match result {
@@ -83,57 +195,132 @@ impl ToolExecutor {
         &self,
         name: &str,
         args: &serde_json::Value,
-        embedding_provider: &dyn EmbeddingProvider,
+        ctx: &ExecutionContext,
     ) -> Result<serde_json::Value> {
         match name {
-            tool_names::ADD_MEMORY => self.add_memory(args, embedding_provider),
-            tool_names::SEARCH_MEMORY => self.search_memory(args, embedding_provider),
+            tool_names::ADD_MEMORY => self.add_memory(args, ctx),
+            tool_names::ADD_MEMORIES => self.add_memories(args, ctx),
+            tool_names::SEARCH_MEMORY => self.search_memory(args, ctx.embedding_provider),
             tool_names::GET_MEMORIES => self.get_memories(args),
             tool_names::DELETE_MEMORY => self.delete_memory(args),
             tool_names::GET_PROFILE => self.get_profile(args),
             tool_names::ADD_RELATIONSHIP => self.add_relationship(args),
             tool_names::GET_RELATIONSHIPS => self.get_relationships(args),
-            tool_names::ADD_REMINDER => self.add_reminder(args, embedding_provider),
-            tool_names::GET_CONTEXT => self.get_context(args, embedding_provider),
+            tool_names::ADD_REMINDER => self.add_reminder(args, ctx.embedding_provider),
+            tool_names::GET_CONTEXT => self.get_context(args, ctx.embedding_provider),
             _ => Err(MemlocalError::InvalidArgument(format!(
                 "Unknown tool: {name}"
             ))),
         }
     }
 
+    // ─────────── add_memory (with semantic dedup) ───────────
+
     fn add_memory(
         &self,
         args: &serde_json::Value,
-        embedding_provider: &dyn EmbeddingProvider,
+        ctx: &ExecutionContext,
     ) -> Result<serde_json::Value> {
         let content = args["content"]
             .as_str()
             .ok_or_else(|| MemlocalError::InvalidArgument("missing 'content'".into()))?;
         let type_str = args["memory_type"].as_str().unwrap_or("factual");
         let user_id = args["user_id"].as_str().map(String::from);
+        let confidence = args["confidence"].as_f64().unwrap_or(0.9);
 
         let memory_type = MemoryType::from_stored_name(type_str);
+
+        // Parse optional temporal fields
+        let valid_at = args["valid_at"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let invalid_at = args["invalid_at"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        // 1. Exact dedup by content hash
+        let hash = MemoryItem::compute_hash(content);
+        if let Some(existing) = self.store.find_by_hash(&hash, user_id.as_deref())? {
+            return Ok(serde_json::json!({
+                "status": "duplicate",
+                "memory_id": existing.id,
+                "reason": "exact content match"
+            }));
+        }
+
+        // 2. Semantic dedup — check for highly similar existing memories
+        let embedding = ctx.embedding_provider.embed_one(content)?;
+        let similar = self
+            .store
+            .search_semantic(&embedding, 3, user_id.as_deref(), None)?;
+
+        if let Some(existing) = similar.first() {
+            let sim_score = existing.score.unwrap_or(0.0);
+            // v5: Lower threshold (0.70) + conflict detection for contradicting specifics
+            let is_near_duplicate = sim_score > 0.85;
+            let is_conflicting =
+                sim_score > 0.70 && has_conflicting_specifics(&existing.content, content);
+            if is_near_duplicate || is_conflicting {
+                // Update the existing memory instead of adding a duplicate
+                let now = Utc::now();
+                let updated = MemoryItem {
+                    id: existing.id.clone(),
+                    content: content.to_string(),
+                    memory_type,
+                    hash: hash.clone(),
+                    user_id: user_id.clone(),
+                    agent_id: None,
+                    session_id: None,
+                    metadata: serde_json::json!({"confidence": confidence}),
+                    created_at: existing.created_at,
+                    updated_at: now,
+                    valid_at,
+                    invalid_at,
+                    score: None,
+                };
+                self.store.put_memory(&updated, &embedding)?;
+
+                return Ok(serde_json::json!({
+                    "status": "updated",
+                    "memory_id": existing.id,
+                    "reason": "semantically similar memory updated"
+                }));
+            }
+        }
+
+        // 3. Store as new
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-
         let item = MemoryItem {
             id: id.clone(),
             content: content.to_string(),
             memory_type,
-            hash: MemoryItem::compute_hash(content),
+            hash,
             user_id,
             agent_id: None,
             session_id: None,
-            metadata: serde_json::Value::Object(Default::default()),
+            metadata: serde_json::json!({"confidence": confidence}),
             created_at: now,
             updated_at: now,
-            valid_at: None,
-            invalid_at: None,
+            valid_at,
+            invalid_at,
             score: None,
         };
 
-        let embedding = embedding_provider.embed_one(content)?;
         self.store.put_memory(&item, &embedding)?;
+
+        // Auto-create edges to semantically related memories (graph intelligence)
+        let similar = self
+            .store
+            .search_semantic(&embedding, 3, item.user_id.as_deref(), None)?;
+        for sim in &similar {
+            if sim.id != id && sim.score.unwrap_or(0.0) > 0.5 {
+                let edge = MemoryEdge::new(id.clone(), sim.id.clone(), MemoryRelation::RelatesTo);
+                let _ = self.store.put_edge(&edge); // best-effort, don't fail on edge error
+            }
+        }
 
         Ok(serde_json::json!({
             "status": "stored",
@@ -141,6 +328,111 @@ impl ToolExecutor {
             "type": memory_type.stored_name(),
         }))
     }
+
+    // ─────────── add_memories (LLM-driven extraction + classification) ───────────
+
+    fn add_memories(
+        &self,
+        args: &serde_json::Value,
+        ctx: &ExecutionContext,
+    ) -> Result<serde_json::Value> {
+        let text = args["text"]
+            .as_str()
+            .ok_or_else(|| MemlocalError::InvalidArgument("missing 'text'".into()))?;
+        let user_id = args["user_id"].as_str();
+
+        let llm = ctx.llm_provider.ok_or_else(|| {
+            MemlocalError::InvalidArgument(
+                "add_memories requires an LlmProvider in ExecutionContext".into(),
+            )
+        })?;
+
+        let temporal = ctx.temporal.cloned().unwrap_or_else(TemporalContext::ist);
+
+        // Call LLM with extraction prompt
+        let user_msg = prompts::build_extraction_user(text, &temporal);
+        let response = llm.complete(prompts::EXTRACTION_SYSTEM, &user_msg)?;
+
+        // Parse JSON response
+        let json_text = response.trim();
+        let json_text = if json_text.starts_with("```") {
+            json_text
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.starts_with("```"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            json_text.to_string()
+        };
+
+        let extracted: Vec<serde_json::Value> = serde_json::from_str(&json_text).map_err(|e| {
+            MemlocalError::Internal(format!("Failed to parse extraction response: {e}"))
+        })?;
+
+        let mut stored = Vec::new();
+        let mut skipped = 0;
+        let mut updated = 0;
+
+        for item in &extracted {
+            let content = match item["content"].as_str() {
+                Some(c) if !c.is_empty() => c,
+                _ => continue,
+            };
+            let type_str = item["type"].as_str().unwrap_or("factual");
+            let confidence = item["confidence"].as_f64().unwrap_or(0.8);
+
+            // Skip low-confidence extractions
+            if confidence < 0.5 {
+                skipped += 1;
+                continue;
+            }
+
+            // Append source text so FTS can match original phrasing too
+            let content_with_source = if text.len() <= 500 {
+                format!("{content}\n[Source: {text}]")
+            } else {
+                // For large texts, just use the extracted content
+                content.to_string()
+            };
+
+            // Build add_memory args with extracted fields
+            let mut add_args = serde_json::json!({
+                "content": content_with_source,
+                "memory_type": type_str,
+                "confidence": confidence,
+            });
+            if let Some(uid) = user_id {
+                add_args["user_id"] = serde_json::Value::String(uid.to_string());
+            }
+            if let Some(va) = item.get("valid_at") {
+                add_args["valid_at"] = va.clone();
+            }
+            if let Some(ia) = item.get("invalid_at") {
+                add_args["invalid_at"] = ia.clone();
+            }
+
+            // Delegate to add_memory (which handles dedup)
+            let result = self.add_memory(&add_args, ctx)?;
+            match result["status"].as_str() {
+                Some("stored") => stored.push(result),
+                Some("updated") => updated += 1,
+                Some("duplicate") => skipped += 1,
+                _ => stored.push(result),
+            }
+        }
+
+        Ok(serde_json::json!({
+            "status": "extracted",
+            "extracted": extracted.len(),
+            "stored": stored.len(),
+            "updated": updated,
+            "skipped": skipped,
+            "memories": stored,
+        }))
+    }
+
+    // ─────────── Remaining tools (unchanged) ───────────
 
     fn search_memory(
         &self,
@@ -151,7 +443,7 @@ impl ToolExecutor {
             .as_str()
             .ok_or_else(|| MemlocalError::InvalidArgument("missing 'query'".into()))?;
         let mode_str = args["mode"].as_str().unwrap_or("hybrid");
-        let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(20) as usize;
         let user_id = args["user_id"].as_str();
         let type_str = args["memory_type"].as_str();
 
@@ -331,7 +623,6 @@ impl ToolExecutor {
 
         self.store.put_prospective(&item)?;
 
-        // Also store as a regular memory for semantic search
         let memory_text = if trigger_type == TriggerType::SemanticMatch {
             trigger_condition.to_string()
         } else {
@@ -383,7 +674,7 @@ impl ToolExecutor {
         let embedding = embedding_provider.embed_one(query)?;
         let memories = self
             .store
-            .search_hybrid(query, &embedding, 10, user_id, None)?;
+            .search_hybrid(query, &embedding, 20, user_id, None)?;
 
         let profile = if let Some(uid) = user_id {
             self.store.get_profile(uid)?
@@ -404,4 +695,42 @@ impl ToolExecutor {
             "retrieval_time_ms": duration_ms,
         }))
     }
+}
+
+/// Decompose a multi-topic query into sub-queries for broader retrieval.
+/// "What's Rahul's job and his fitness goal?" → ["Rahul's job", "Rahul's fitness goal"]
+fn decompose_query(query: &str) -> Vec<String> {
+    let lower = query.to_lowercase();
+    // Split on common conjunctions
+    let parts: Vec<&str> = lower
+        .split(['?', '.'])
+        .next()
+        .unwrap_or(&lower)
+        .split(" and ")
+        .flat_map(|s| s.split(" also "))
+        .flat_map(|s| s.split(" as well as "))
+        .map(|s| s.trim())
+        .filter(|s| s.len() > 5)
+        .collect();
+
+    if parts.len() > 1 {
+        parts.into_iter().map(String::from).collect()
+    } else {
+        vec![query.to_string()]
+    }
+}
+
+/// Check if two similar memories have conflicting specific values (numbers, dates, times).
+/// Used for contradiction detection at storage time.
+fn has_conflicting_specifics(old: &str, new: &str) -> bool {
+    let extract_nums = |s: &str| -> Vec<String> {
+        s.split_whitespace()
+            .filter(|w| w.chars().any(|c| c.is_ascii_digit()))
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let old_nums = extract_nums(old);
+    let new_nums = extract_nums(new);
+    // Both have numeric specifics but they differ → likely a contradiction
+    !old_nums.is_empty() && !new_nums.is_empty() && old_nums != new_nums
 }

@@ -1,7 +1,7 @@
 use reqwest::blocking::Client;
 
 use crate::error::{MemlocalError, Result};
-use crate::tools::{ToolCall, ToolDefinition};
+use crate::tools::{LlmProvider, ToolCall, ToolDefinition};
 
 /// A message in a conversation with an LLM.
 #[derive(Clone, Debug)]
@@ -267,5 +267,12 @@ impl AnthropicClient {
             input_tokens,
             output_tokens,
         })
+    }
+}
+
+impl LlmProvider for AnthropicClient {
+    fn complete(&self, system: &str, user: &str) -> Result<String> {
+        let resp = self.complete(&[LlmMessage::system(system), LlmMessage::user(user)], &[])?;
+        Ok(resp.content)
     }
 }
