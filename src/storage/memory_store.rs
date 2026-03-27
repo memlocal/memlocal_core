@@ -70,6 +70,12 @@ impl MemoryStore {
         ));
         self.try_run(&MemorySchema::create_fts_index());
         self.try_run(&MemorySchema::create_lsh_index());
+        self.try_run(&MemorySchema::create_triples_fts_index());
+        self.try_run(&MemorySchema::create_summaries_vector_index(
+            self.embedding_dim,
+            config.hnsw_m,
+            config.hnsw_ef_construction,
+        ));
         debug!("[MemoryStore] Indices ensured");
 
         // Verify
@@ -125,10 +131,13 @@ impl MemoryStore {
         // v4: Use ASSERT validity for time-travel support
         let script = format!(
             "?[id, vld, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, embedding, created_at, updated_at, event_start, event_end] <- \
              [[$id, 'ASSERT', $content, $type, $hash, $user_id, $agent_id, $session_id, \
+             $speaker, $document_date, \
              $metadata_json, vec($embedding), $created_at, $updated_at, $event_start, $event_end]]\n\
              :put {} {{id, vld => content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, embedding, created_at, updated_at, event_start, event_end}}",
             MemorySchema::MEMORIES
         );
@@ -153,6 +162,17 @@ impl MemoryStore {
                 "session_id".into(),
                 DataValue::Str(json_str(&m["session_id"]).into()),
             ),
+            ("speaker".into(), DataValue::Str(
+                item.metadata.get("speaker")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into()
+            )),
+            ("document_date".into(), DataValue::from(
+                item.metadata.get("document_date")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+            )),
             (
                 "metadata_json".into(),
                 DataValue::Str(json_str(&m["metadata_json"]).into()),
@@ -192,8 +212,10 @@ impl MemoryStore {
     pub fn get_memory(&self, id: &str) -> Result<Option<MemoryItem>> {
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              *{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, \
              event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}, id == $id",
             MemorySchema::MEMORIES
@@ -218,6 +240,7 @@ impl MemoryStore {
         // v4: Use @ "NOW" time-travel instead of invalid_at == 0.0 filter
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, \
              event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
@@ -235,6 +258,7 @@ impl MemoryStore {
 
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              {}\n:order -updated_at\n:limit {}",
             conditions.join(", "),
@@ -254,6 +278,7 @@ impl MemoryStore {
     ) -> Result<Vec<MemoryItem>> {
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, \
              event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
@@ -270,6 +295,7 @@ impl MemoryStore {
 
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              {}\n:order valid_at, -updated_at\n:limit {}",
             conditions.join(", "),
@@ -286,11 +312,14 @@ impl MemoryStore {
         // RETRACT requires all value columns. Get current values, then retract.
         let script = format!(
             "?[id, vld, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, embedding, created_at, updated_at, event_start, event_end] := \
              *{rel}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, embedding, created_at, updated_at, event_start, event_end, @ \"NOW\"}}, \
              id == $id, vld = 'RETRACT'\n\
              :put {rel} {{id, vld => content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, embedding, created_at, updated_at, event_start, event_end}}",
             rel = MemorySchema::MEMORIES
         );
@@ -309,6 +338,7 @@ impl MemoryStore {
     pub fn find_by_hash(&self, hash: &str, user_id: Option<&str>) -> Result<Option<MemoryItem>> {
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, \
              event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
@@ -325,6 +355,7 @@ impl MemoryStore {
 
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              {}\n:limit 1",
             conditions.join(", ")
@@ -436,9 +467,11 @@ impl MemoryStore {
         };
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                           speaker, document_date, \
                            metadata_json, created_at, updated_at, \
                            event_start: valid_at, event_end: invalid_at";
         let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             speaker, document_date, \
                              metadata_json, created_at, updated_at, valid_at, invalid_at";
 
         let filter_clause = if filter.is_empty() {
@@ -480,9 +513,11 @@ impl MemoryStore {
         }
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                           speaker, document_date, \
                            metadata_json, created_at, updated_at, \
                            event_start: valid_at, event_end: invalid_at";
         let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             speaker, document_date, \
                              metadata_json, created_at, updated_at, valid_at, invalid_at";
 
         let script = format!(
@@ -513,9 +548,11 @@ impl MemoryStore {
         }
 
         let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                           speaker, document_date, \
                            metadata_json, created_at, updated_at, \
                            event_start: valid_at, event_end: invalid_at";
         let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             speaker, document_date, \
                              metadata_json, created_at, updated_at, valid_at, invalid_at";
 
         let script = format!(
@@ -776,6 +813,7 @@ impl MemoryStore {
 
         let mut conditions = vec![format!(
             "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, \
              event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
             MemorySchema::MEMORIES
@@ -796,6 +834,7 @@ impl MemoryStore {
 
         let script = format!(
             "?[id, content, type, hash, user_id, agent_id, session_id, \
+             speaker, document_date, \
              metadata_json, created_at, updated_at, valid_at, invalid_at] := \
              {}\n:order -valid_at\n:limit {}",
             conditions.join(", "),
@@ -1215,6 +1254,8 @@ impl MemoryStore {
                     "mem_conversations",
                     "mem_profiles",
                     "mem_prospective",
+                    "mem_triples",
+                    "mem_summaries",
                 ]
                 .iter()
                 .copied(),
@@ -1243,6 +1284,240 @@ impl MemoryStore {
         }
         Ok(serde_json::Value::Object(export))
     }
+
+    // ──────────── Triples ────────────
+
+    /// Insert or update a semantic triple.
+    pub fn put_triple(&self, triple: &Triple) -> Result<()> {
+        let script = format!(
+            "?[subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence] <- \
+             [[$subject, $predicate, $object, $memory_id, $speaker, $mention_count, \
+             $last_mentioned, $session_id, $confidence]]\n\
+             :put {} {{subject, predicate, object => memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence}}",
+            MemorySchema::TRIPLES
+        );
+        let params = BTreeMap::from([
+            ("subject".into(), DataValue::Str(triple.subject.clone().into())),
+            ("predicate".into(), DataValue::Str(triple.predicate.clone().into())),
+            ("object".into(), DataValue::Str(triple.object.clone().into())),
+            ("memory_id".into(), DataValue::Str(triple.memory_id.clone().into())),
+            ("speaker".into(), DataValue::Str(triple.speaker.clone().into())),
+            ("mention_count".into(), DataValue::from(triple.mention_count as i64)),
+            ("last_mentioned".into(), DataValue::from(triple.last_mentioned)),
+            ("session_id".into(), DataValue::Str(triple.session_id.clone().into())),
+            ("confidence".into(), DataValue::from(triple.confidence)),
+        ]);
+        self.run_mutable(&script, params)?;
+        Ok(())
+    }
+
+    /// Search triples by subject and/or predicate.
+    pub fn search_triples(
+        &self,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        object: Option<&str>,
+    ) -> Result<Vec<Triple>> {
+        let mut conditions = vec![format!(
+            "*{}{{subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence}}",
+            MemorySchema::TRIPLES
+        )];
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+
+        if let Some(s) = subject {
+            conditions.push("subject == $s".into());
+            params.insert("s".into(), DataValue::Str(s.into()));
+        }
+        if let Some(p) = predicate {
+            conditions.push("predicate == $p".into());
+            params.insert("p".into(), DataValue::Str(p.into()));
+        }
+        if let Some(o) = object {
+            conditions.push("object == $o".into());
+            params.insert("o".into(), DataValue::Str(o.into()));
+        }
+
+        let script = format!(
+            "?[subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence] := {}",
+            conditions.join(", ")
+        );
+
+        let result = self.run_immutable(&script, params)?;
+        let mut triples = Vec::new();
+        for row in &result.rows {
+            triples.push(Triple {
+                subject: dv_to_string(&row[0]),
+                predicate: dv_to_string(&row[1]),
+                object: dv_to_string(&row[2]),
+                memory_id: dv_to_string(&row[3]),
+                speaker: dv_to_string(&row[4]),
+                mention_count: dv_to_i64(&row[5]) as u64,
+                last_mentioned: dv_to_f64(&row[6]),
+                session_id: dv_to_string(&row[7]),
+                confidence: dv_to_f64(&row[8]),
+            });
+        }
+        Ok(triples)
+    }
+
+    /// Full-text search on triples.
+    pub fn search_triples_fts(&self, query: &str, k: usize) -> Result<Vec<Triple>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(vec![]);
+        }
+        let script = format!(
+            "?[subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence, score] := \
+             ~{}:{}{{subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence | query: $q, k: {}, bind_score: score}}",
+            MemorySchema::TRIPLES,
+            MemorySchema::TRIPLES_FTS_INDEX,
+            k
+        );
+        let params = BTreeMap::from([("q".into(), DataValue::Str(sanitized.into()))]);
+        let result = self.run_immutable(&script, params)?;
+        let mut triples = Vec::new();
+        for row in &result.rows {
+            triples.push(Triple {
+                subject: dv_to_string(&row[0]),
+                predicate: dv_to_string(&row[1]),
+                object: dv_to_string(&row[2]),
+                memory_id: dv_to_string(&row[3]),
+                speaker: dv_to_string(&row[4]),
+                mention_count: dv_to_i64(&row[5]) as u64,
+                last_mentioned: dv_to_f64(&row[6]),
+                session_id: dv_to_string(&row[7]),
+                confidence: dv_to_f64(&row[8]),
+            });
+        }
+        Ok(triples)
+    }
+
+    /// Increment the mention count for an existing triple.
+    pub fn increment_triple_mention(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        last_mentioned: f64,
+    ) -> Result<()> {
+        // First get the current mention_count
+        let existing = self.search_triples(Some(subject), Some(predicate), Some(object))?;
+        if let Some(triple) = existing.first() {
+            let new_count = triple.mention_count + 1;
+            let script = format!(
+                "?[subject, predicate, object, mention_count, last_mentioned] <- \
+                 [[$s, $p, $o, {}, {}]]\n\
+                 :update {} {{subject, predicate, object => mention_count, last_mentioned}}",
+                new_count, last_mentioned, MemorySchema::TRIPLES
+            );
+            let params = BTreeMap::from([
+                ("s".into(), DataValue::Str(subject.into())),
+                ("p".into(), DataValue::Str(predicate.into())),
+                ("o".into(), DataValue::Str(object.into())),
+            ]);
+            self.run_mutable(&script, params)?;
+        }
+        Ok(())
+    }
+
+    /// Get all known speakers (distinct subjects from triples that are people).
+    pub fn get_known_speakers(&self, _user_id: Option<&str>) -> Result<Vec<String>> {
+        let script = format!(
+            "?[speaker] := *{}{{speaker}}, speaker != ''",
+            MemorySchema::TRIPLES
+        );
+        let result = self.run_immutable(&script, BTreeMap::new())?;
+        let mut speakers = Vec::new();
+        for row in &result.rows {
+            speakers.push(dv_to_string(&row[0]));
+        }
+        Ok(speakers)
+    }
+
+    // ──────────── Summaries ────────────
+
+    /// Store a session summary with embedding.
+    pub fn put_summary(
+        &self,
+        session_id: &str,
+        summary: &str,
+        embedding: &[f32],
+        speakers: &[String],
+        topics: &[String],
+        doc_date: f64,
+    ) -> Result<()> {
+        let embedding_dv: Vec<DataValue> = embedding
+            .iter()
+            .map(|&f| DataValue::from(f as f64))
+            .collect();
+        let speakers_json = serde_json::to_string(speakers).unwrap_or_else(|_| "[]".to_string());
+        let topics_json = serde_json::to_string(topics).unwrap_or_else(|_| "[]".to_string());
+
+        let script = format!(
+            "?[session_id, summary, speakers_json, key_topics_json, document_date, embedding] <- \
+             [[$session_id, $summary, $speakers_json, $key_topics_json, $doc_date, vec($embedding)]]\n\
+             :put {} {{session_id => summary, speakers_json, key_topics_json, document_date, embedding}}",
+            MemorySchema::SUMMARIES
+        );
+        let params = BTreeMap::from([
+            ("session_id".into(), DataValue::Str(session_id.into())),
+            ("summary".into(), DataValue::Str(summary.into())),
+            ("speakers_json".into(), DataValue::Str(speakers_json.into())),
+            ("key_topics_json".into(), DataValue::Str(topics_json.into())),
+            ("doc_date".into(), DataValue::from(doc_date)),
+            ("embedding".into(), DataValue::List(embedding_dv)),
+        ]);
+        self.run_mutable(&script, params)?;
+        Ok(())
+    }
+
+    /// Search summaries by vector similarity.
+    pub fn search_summaries(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<SessionSummary>> {
+        let embedding_dv: Vec<DataValue> = query_embedding
+            .iter()
+            .map(|&f| DataValue::from(f as f64))
+            .collect();
+        let script = format!(
+            "?[session_id, summary, speakers_json, key_topics_json, document_date, distance] := \
+             ~{}:{}{{session_id, summary, speakers_json, key_topics_json, document_date | \
+             query: vec($q), k: {}, bind_distance: distance, ef: {}}}",
+            MemorySchema::SUMMARIES,
+            MemorySchema::SUMMARIES_VECTOR_INDEX,
+            k,
+            k * 2
+        );
+        let params = BTreeMap::from([("q".into(), DataValue::List(embedding_dv))]);
+        let result = self.run_immutable(&script, params)?;
+        let mut summaries = Vec::new();
+        for row in &result.rows {
+            let speakers_str = dv_to_string(&row[2]);
+            let topics_str = dv_to_string(&row[3]);
+            let speakers: Vec<String> = serde_json::from_str(&speakers_str).unwrap_or_default();
+            let key_topics: Vec<String> = serde_json::from_str(&topics_str).unwrap_or_default();
+            let distance = dv_to_f64(&row[5]);
+            summaries.push(SessionSummary {
+                session_id: dv_to_string(&row[0]),
+                summary: dv_to_string(&row[1]),
+                speakers,
+                key_topics,
+                document_date: dv_to_f64(&row[4]),
+                score: Some(1.0 - distance),
+            });
+        }
+        Ok(summaries)
+    }
+
+    // ──────────── Export/Import + Compact ────────────
 
     /// Compact the database for optimal query performance.
     /// Call after bulk operations (storing many memories).

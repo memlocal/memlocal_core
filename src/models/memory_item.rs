@@ -49,6 +49,8 @@ impl MemoryItem {
             "user_id": self.user_id.as_deref().unwrap_or(""),
             "agent_id": self.agent_id.as_deref().unwrap_or(""),
             "session_id": self.session_id.as_deref().unwrap_or(""),
+            "speaker": self.metadata.get("speaker").and_then(|v| v.as_str()).unwrap_or(""),
+            "document_date": self.metadata.get("document_date").and_then(|v| v.as_f64()).unwrap_or(0.0),
             "metadata_json": serde_json::to_string(&self.metadata).unwrap_or_else(|_| "{}".to_string()),
             "created_at": self.created_at.timestamp_millis() as f64 / 1000.0,
             "updated_at": self.updated_at.timestamp_millis() as f64 / 1000.0,
@@ -79,12 +81,28 @@ impl MemoryItem {
         let agent_id = empty_to_none(map["agent_id"].as_str());
         let session_id = empty_to_none(map["session_id"].as_str());
 
-        let metadata: serde_json::Value = match map["metadata_json"].as_str() {
+        let mut metadata: serde_json::Value = match map["metadata_json"].as_str() {
             Some(s) if !s.is_empty() => {
                 serde_json::from_str(s).unwrap_or(serde_json::Value::Object(Default::default()))
             }
             _ => serde_json::Value::Object(Default::default()),
         };
+
+        // Merge speaker and document_date from top-level columns into metadata
+        if let Some(speaker) = map.get("speaker").and_then(|v| v.as_str()) {
+            if !speaker.is_empty() {
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("speaker".to_string(), serde_json::json!(speaker));
+                }
+            }
+        }
+        if let Some(doc_date) = map.get("document_date").and_then(|v| v.as_f64()) {
+            if doc_date > 0.0 {
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("document_date".to_string(), serde_json::json!(doc_date));
+                }
+            }
+        }
 
         let created_at = epoch_to_datetime(map["created_at"].as_f64().unwrap_or(0.0));
         let updated_at = epoch_to_datetime(map["updated_at"].as_f64().unwrap_or(0.0));
