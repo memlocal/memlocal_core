@@ -1624,6 +1624,117 @@ impl MemoryStore {
         self.try_run(MemorySchema::compact_statement());
         Ok(())
     }
+
+    // ──────────── CozoDB-Specific Optimizations ────────────
+
+    /// Recursive Datalog graph search: finds all memories reachable within N hops.
+    /// Replaces imperative 2-hop traversal with a single CozoDB query.
+    pub fn search_graph_recursive(
+        &self,
+        seed_ids: &[String],
+        max_hops: usize,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        if seed_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build seed list for Datalog
+        let seeds_list = seed_ids
+            .iter()
+            .map(|id| format!("[\"{}\"]", id.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut filter_clause = String::new();
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+        if let Some(uid) = user_id {
+            filter_clause = ", user_id == $uid".to_string();
+            params.insert("uid".into(), DataValue::Str(uid.into()));
+        }
+
+        // Recursive Datalog: find all memories reachable within N hops
+        let script = format!(
+            "seed[id] <- [{seeds}] \n\
+             reachable[id, 0] := seed[id] \n\
+             reachable[to_id, d + 1] := reachable[from_id, d], \
+                 *{edges}{{from_id, to_id}}, d < {hops} \n\
+             ?[id, content, type, hash, user_id, agent_id, session_id, \
+               speaker, document_date, metadata_json, created_at, updated_at, \
+               valid_at, invalid_at] := \
+                 reachable[id, _], \
+                 *{mem}{{id, content, type, hash, user_id, agent_id, session_id, \
+                 speaker, document_date, metadata_json, created_at, updated_at, \
+                 event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}{filter}",
+            seeds = seeds_list,
+            edges = MemorySchema::EDGES,
+            hops = max_hops,
+            mem = MemorySchema::MEMORIES,
+            filter = filter_clause,
+        );
+
+        let result = self.run_immutable(&script, params)?;
+        rows_to_items(&result)
+    }
+
+    /// Time-travel query: retrieves memories as they existed at a specific point in time.
+    /// Uses CozoDB's HNSW vector search and filters by created_at timestamp in Rust.
+    pub fn search_at_time(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+        at_time: f64, // UTC epoch seconds
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        let mut filter_parts = Vec::new();
+        if let Some(uid) = user_id {
+            filter_parts.push(format!("user_id == \"{}\"", uid));
+        }
+        let filter = if filter_parts.is_empty() {
+            String::new()
+        } else {
+            format!(", filter: {}", filter_parts.join(" && "))
+        };
+
+        let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                           speaker, document_date, metadata_json, created_at, updated_at, \
+                           event_start: valid_at, event_end: invalid_at";
+        let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             speaker, document_date, metadata_json, created_at, updated_at, \
+                             valid_at, invalid_at";
+
+        // Use CozoDB HNSW search and filter by created_at in Rust
+        // Full CozoDB time-travel on HNSW requires passing a timestamp to the validity clause,
+        // which may not work with HNSW indices. The created_at filter approach is the fallback.
+        let script = format!(
+            "?[{output_fields}, distance] := ~{}:{}{{ {bind_fields} | \
+             query: vec($q), k: {k}, ef: {ef}, bind_distance: distance{filter} }}",
+            MemorySchema::MEMORIES,
+            MemorySchema::VECTOR_INDEX,
+            ef = k * 2,
+        );
+
+        let embedding_dv: Vec<DataValue> = query_embedding
+            .iter()
+            .map(|&f| DataValue::from(f as f64))
+            .collect();
+        let params = BTreeMap::from([("q".into(), DataValue::List(embedding_dv))]);
+
+        let result = self.run_immutable(&script, params)?;
+        let mut items = Vec::new();
+        for i in 0..result.rows.len() {
+            let map = rows_to_json(&result, i);
+            let item = MemoryItem::from_map(&map)?;
+            let raw_score = 1.0 - map["distance"].as_f64().unwrap_or(0.0);
+            // Filter out items that were created AFTER the at_time
+            let created_ts = item.created_at.timestamp_millis() as f64 / 1000.0;
+            if created_ts <= at_time {
+                let adjusted = Self::apply_confidence(&item, raw_score);
+                items.push(item.with_score(adjusted));
+            }
+        }
+        Ok(items)
+    }
 }
 
 // ──────────── Helpers ────────────

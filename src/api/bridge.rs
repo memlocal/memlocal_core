@@ -298,6 +298,29 @@ impl MemlocalEngine {
             .get_important_memories(user_id, limit, min_importance)
     }
 
+    // --- CozoDB-Specific Optimizations ---
+
+    /// Recursive graph search using CozoDB Datalog.
+    pub fn search_graph_recursive(
+        &self,
+        seed_ids: &[String],
+        max_hops: usize,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        self.store.search_graph_recursive(seed_ids, max_hops, user_id)
+    }
+
+    /// Time-travel semantic search: finds memories as they existed at a point in time.
+    pub fn search_at_time(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        at_time: f64,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        self.store.search_at_time(embedding, k, at_time, user_id)
+    }
+
     // --- Export/Import ---
 
     pub fn export_relations(&self) -> Result<serde_json::Value> {
