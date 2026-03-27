@@ -120,20 +120,54 @@ impl TemporalContext {
 // anchor memories from raw conversation text.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-pub const EXTRACTION_SYSTEM: &str = r#"You are a memory extraction engine. Analyze the text and extract
+pub const EXTRACTION_SYSTEM: &str = r#"You are a memory extraction engine (v2). Analyze the text and extract
 distinct facts, preferences, events, skills, relationships, emotions,
 locations, and intentions.
 
-For each extracted memory, output a JSON array of objects. Each object must
-have these fields:
+OUTPUT FORMAT — structured JSON object (NOT an array):
+{
+  "memories": [ ... ],
+  "session_summary": "...",
+  "speakers_detected": ["..."]
+}
+
+Each object in the "memories" array MUST have ALL of these fields:
 - "content": a single, self-contained factual statement
 - "type": one of: episodic, semantic, factual, procedural, social, spatial, prospective, affective
 - "confidence": a number from 0.0 to 1.0 indicating certainty
+- "speaker": the name of the person this fact is about or who stated it (see SPEAKER IDENTITY below)
+- "triple": {"subject": "...", "predicate": "...", "object": "..."} — a semantic triple (see TRIPLE RULES below)
+- "contradicts_pattern": a search pattern string, or null (see CONTRADICTION DETECTION below)
 
 Optional temporal fields (include ONLY for time-anchored items):
 - "valid_at": UTC ISO 8601 datetime when this event/fact starts (e.g., "2026-03-20T15:30:00Z")
 - "invalid_at": UTC ISO 8601 datetime when this memory expires/becomes irrelevant
   For single-day events, set to end-of-day UTC. Omit for persistent facts.
+
+Top-level fields:
+- "session_summary": 2-3 sentences summarizing the conversation's narrative arc. Mention speakers
+  by name and what they discussed. Include specific dates and key facts mentioned.
+- "speakers_detected": array of ALL speaker names detected in the text. Use actual names.
+  If a single unnamed user is speaking, use ["user"].
+
+TRIPLE RULES:
+Every memory MUST include a "triple" field with:
+- "subject": a named entity (person name, place, thing). NEVER a pronoun like "she" or "they".
+- "predicate": a short verb phrase (e.g., "loves", "works at", "is allergic to", "lives in").
+- "object": a specific value (e.g., "abstract art", "Google", "peanuts", "Koramangala").
+Examples:
+  Content: "Caroline loves abstract art" → {"subject": "Caroline", "predicate": "loves", "object": "abstract art"}
+  Content: "Melanie's kids like dinosaurs" → {"subject": "Melanie's kids", "predicate": "like", "object": "dinosaurs"}
+  Content: "Arjun works at Google" → {"subject": "Arjun", "predicate": "works at", "object": "Google"}
+
+CONTRADICTION DETECTION:
+When extracting a memory that might update or contradict something previously stated in the
+conversation, set "contradicts_pattern" to a search string of the form "subject predicate_keyword".
+Examples:
+- Someone changes their favorite color → "contradicts_pattern": "Caroline favorite color"
+- Someone moves to a new city → "contradicts_pattern": "Caroline lives in"
+- Someone changes jobs → "contradicts_pattern": "Arjun works at"
+Set to null when no contradiction is suspected. Most memories will have null.
 
 Type classification rules:
 - episodic: events, experiences, meetings, trips (things that happened or will happen)
@@ -153,10 +187,11 @@ Confidence guidelines:
 CRITICAL — SPEAKER IDENTITY:
 The text may be a conversation between two or more named speakers.
 Do NOT flatten all speakers to "The user". Use the ACTUAL SPEAKER NAME:
-- If "Caroline: I love abstract art" → "Caroline loves abstract art"
-- If "Melanie: My kids really like dinosaurs" → "Melanie's kids like dinosaurs"
-- If a single user is speaking (no named speakers), use "The user ..."
+- If "Caroline: I love abstract art" → content: "Caroline loves abstract art", speaker: "Caroline"
+- If "Melanie: My kids really like dinosaurs" → content: "Melanie's kids like dinosaurs", speaker: "Melanie"
+- If a single user is speaking (no named speakers), set speaker to "user"
 Always attribute facts, opinions, and experiences to the correct named speaker.
+The "speaker" field must match the person the fact is ABOUT or who stated it.
 
 CRITICAL — Temporal resolution rules:
 You will be given CURRENT DATE AND TIME with timezone. Use it to resolve ALL relative references:
@@ -169,8 +204,12 @@ You will be given CURRENT DATE AND TIME with timezone. Use it to resolve ALL rel
 ALL valid_at/invalid_at MUST be in UTC with Z suffix. Do the timezone math carefully.
 When content contains relative dates, REWRITE the content with the resolved absolute date:
   "Meeting with X tomorrow at 9pm" → "Caroline has a meeting with X on Thursday, 20 March 2026 at 21:00 IST (15:30 UTC)"
+
+SESSION TIMESTAMP ANCHORING:
 When the text includes session timestamps like [Session N, datetime], use that datetime
-as the anchor for the event. Set valid_at to the session datetime converted to UTC.
+as the anchor for ALL events in that session. Set valid_at to the session datetime converted to UTC.
+Events within a session that reference "today", "this morning", etc. should resolve relative to
+the session datetime, not the current time.
 
 CRITICAL — PRESERVE EXACT WORDING:
 When extracting, you MUST keep the exact original words for:
@@ -181,6 +220,15 @@ When extracting, you MUST keep the exact original words for:
 - Place names, company names, product names: keep exactly as stated
 The extracted content MUST contain the SAME specific words the speaker used.
 
+WRONG: "Melanie's kids enjoy creative activities" (too vague, not what was said)
+RIGHT: "Melanie's kids like dinosaurs and nature" (exact words from text)
+
+WRONG: "Caroline participated in community events" (vague generalization)
+RIGHT: "Caroline attended a pride parade" (specific event mentioned)
+
+WRONG: "They discussed weekend plans" (vague, uses pronoun)
+RIGHT: "Arjun plans to visit Devaraj Market on Saturday" (specific, named, exact)
+
 Rules:
 1. Each memory must be atomic — one fact per item.
 2. Use the speaker's actual name (not "The user") when names are present in the text.
@@ -189,8 +237,9 @@ Rules:
 5. For emotions/moods, use affective type.
 6. For "remember to..." or future intentions, use prospective type.
 7. Ignore greetings, filler, and meta-conversation.
+8. Every memory MUST have a triple and a speaker — no exceptions.
 
-Only output the JSON array. No explanation, no markdown fencing."#;
+Only output the JSON object. No explanation, no markdown fencing."#;
 
 /// Build the user message for memory extraction.
 pub fn build_extraction_user(text: &str, temporal: &TemporalContext) -> String {
