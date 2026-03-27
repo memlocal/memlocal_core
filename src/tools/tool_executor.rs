@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -35,6 +36,36 @@ pub struct ToolResult {
     pub content: String,
     pub duration_ms: u64,
     pub success: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RetrievedMemoryDiagnostic {
+    pub id: String,
+    pub memory_type: String,
+    pub rank: usize,
+    pub score: Option<f64>,
+    pub sources: Vec<String>,
+    pub included_in_context: bool,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrepareContextDiagnostics {
+    pub query: String,
+    pub sub_queries: Vec<String>,
+    pub total_unique_retrieved: usize,
+    pub context_limit: usize,
+    pub truncated_count: usize,
+    pub source_counts: BTreeMap<String, usize>,
+    pub ranked_memories: Vec<RetrievedMemoryDiagnostic>,
+    pub reserved_keyword_match_ids: Vec<String>,
+    pub context_char_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PreparedContext {
+    pub context_block: String,
+    pub diagnostics: PrepareContextDiagnostics,
 }
 
 /// Optional providers passed to `execute`. Only `add_memories` needs the LLM provider.
@@ -93,12 +124,42 @@ impl ToolExecutor {
         max_results: Option<usize>,
         bm25_only: bool,
     ) -> Result<String> {
-        // v5: Query decomposition — split multi-topic queries and search each
-        let sub_queries = decompose_query(query);
+        Ok(self
+            .prepare_context_with_diagnostics(
+                query,
+                embedding_provider,
+                user_id,
+                max_results,
+                bm25_only,
+            )?
+            .context_block)
+    }
+
+    pub fn prepare_context_with_diagnostics(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+        bm25_only: bool,
+    ) -> Result<PreparedContext> {
+        // Query shaping: search the original question plus compact, person-focused,
+        // and temporal-aware variants so retrieval does not depend on the exact wording.
+        let sub_queries = build_query_variants(query);
+        let temporal_focus = is_temporal_query(query);
         let mut all_memories = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_ids = HashSet::new();
+        let mut memory_sources: HashMap<String, BTreeSet<String>> = HashMap::new();
+
+        let mut register_item = |item: &MemoryItem, source: &str| {
+            memory_sources
+                .entry(item.id.clone())
+                .or_default()
+                .insert(source.to_string());
+        };
 
         for sq in &sub_queries {
+            let mut session_seed_ids: Vec<String> = Vec::new();
             if !bm25_only {
                 let emb = embedding_provider.embed_one(sq)?;
 
@@ -108,6 +169,9 @@ impl ToolExecutor {
                     (MemoryType::Factual, 10),
                     (MemoryType::Semantic, 8),
                     (MemoryType::Social, 5),
+                    (MemoryType::Affective, 5),
+                    (MemoryType::Prospective, 5),
+                    (MemoryType::Procedural, 3),
                 ];
 
                 for (mem_type, k) in &type_searches {
@@ -115,6 +179,16 @@ impl ToolExecutor {
                         self.store
                             .search_hybrid_deduped(sq, &emb, *k, user_id, Some(*mem_type))?;
                     for item in results {
+                        if temporal_focus
+                            && matches!(item.memory_type, MemoryType::Episodic | MemoryType::Prospective)
+                        {
+                            if let Some(session_id) = item.session_id.as_ref() {
+                                if !session_seed_ids.iter().any(|existing| existing == session_id) {
+                                    session_seed_ids.push(session_id.clone());
+                                }
+                            }
+                        }
+                        register_item(&item, &format!("type:{}", mem_type.stored_name()));
                         if seen_ids.insert(item.id.clone()) {
                             all_memories.push(item);
                         }
@@ -126,8 +200,39 @@ impl ToolExecutor {
                     self.store
                         .search_hybrid_deduped(sq, &emb, 10, user_id, None)?;
                 for item in results {
+                    register_item(&item, "hybrid:catch_all");
                     if seen_ids.insert(item.id.clone()) {
                         all_memories.push(item);
+                    }
+                }
+
+                // 2b. Graph search — 2-hop edge traversal from semantic seeds
+                let graph_results =
+                    self.store.search_graph(&emb, 5, user_id, None, 2)?;
+                for item in graph_results {
+                    if temporal_focus {
+                        if let Some(session_id) = item.session_id.as_ref() {
+                            if !session_seed_ids.iter().any(|existing| existing == session_id) {
+                                session_seed_ids.push(session_id.clone());
+                            }
+                        }
+                    }
+                    register_item(&item, "graph:2hop");
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
+                }
+
+                if temporal_focus {
+                    for session_id in session_seed_ids.iter().take(3) {
+                        let session_results =
+                            self.store.get_memories_by_session(session_id, user_id, 10)?;
+                        for item in session_results {
+                            register_item(&item, &format!("session:{session_id}"));
+                            if seen_ids.insert(item.id.clone()) {
+                                all_memories.push(item);
+                            }
+                        }
                     }
                 }
             }
@@ -143,6 +248,7 @@ impl ToolExecutor {
                             continue;
                         }
                     }
+                    register_item(&item, &format!("bm25:entity:{entity}"));
                     if seen_ids.insert(item.id.clone()) {
                         all_memories.push(item);
                     }
@@ -160,6 +266,7 @@ impl ToolExecutor {
                             continue;
                         }
                     }
+                    register_item(&item, &format!("bm25:keywords:{keywords}"));
                     if seen_ids.insert(item.id.clone()) {
                         all_memories.push(item);
                     }
@@ -174,26 +281,27 @@ impl ToolExecutor {
         for sq in &sub_queries {
             let entities = extract_entities(sq);
             for entity in &entities {
-                let results = self.store.search_text(entity, 3)?;
+                let results = self.store.search_text(entity, 5)?;
                 for item in results {
                     if let Some(uid) = user_id {
                         if item.user_id.as_deref() != Some(uid) {
                             continue;
                         }
                     }
+                    register_item(&item, &format!("bm25:reserved:{entity}"));
                     if bm25_reserved_ids.insert(item.id.clone()) {
                         bm25_reserved.push(item);
                     }
                 }
             }
         }
-        // Cap reserved slots at 10 to avoid flooding context
+        // Cap reserved slots at 15 to avoid flooding context
         bm25_reserved.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        bm25_reserved.truncate(10);
+        bm25_reserved.truncate(15);
 
         // --- Fix 3: Keyword overlap boost ---
         // Boost scores of memories containing exact query keywords
@@ -215,6 +323,8 @@ impl ToolExecutor {
             }
         }
 
+        apply_query_aware_boosts(&mut all_memories, query);
+
         // Sort by boosted score, keep top results
         all_memories.sort_by(|a, b| {
             b.score
@@ -222,14 +332,29 @@ impl ToolExecutor {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let limit = max_results.unwrap_or(30);
+        let total_unique_retrieved = all_memories.len();
+        let truncated_count = total_unique_retrieved.saturating_sub(limit);
+        let ranked_before_truncation: Vec<RetrievedMemoryDiagnostic> = all_memories
+            .iter()
+            .enumerate()
+            .map(|(index, item)| RetrievedMemoryDiagnostic {
+                id: item.id.clone(),
+                memory_type: item.memory_type.stored_name().to_string(),
+                rank: index + 1,
+                score: item.score,
+                sources: memory_sources
+                    .get(&item.id)
+                    .map(|sources| sources.iter().cloned().collect())
+                    .unwrap_or_default(),
+                included_in_context: index < limit,
+                content: item.content.clone(),
+            })
+            .collect();
         all_memories.truncate(limit);
 
         // --- Option C: BM25 reserved hits go into a separate priority section ---
         // These are displayed as "KEY FACTS" at the top of the context block
-        let keyword_matches: Vec<MemoryItem> = bm25_reserved
-            .into_iter()
-            .filter(|item| !seen_ids.contains(&item.id))
-            .collect();
+        let keyword_matches = bm25_reserved;
 
         // Get user profile
         let profile = match user_id {
@@ -257,7 +382,28 @@ impl ToolExecutor {
         wm.set_profile(profile);
         wm.set_triggered_reminders(prospective);
 
-        Ok(wm.to_context_block())
+        let context_block = wm.to_context_block();
+        let mut source_counts = BTreeMap::new();
+        for sources in memory_sources.values() {
+            for source in sources {
+                *source_counts.entry(source.clone()).or_insert(0) += 1;
+            }
+        }
+
+        Ok(PreparedContext {
+            diagnostics: PrepareContextDiagnostics {
+                query: query.to_string(),
+                sub_queries,
+                total_unique_retrieved,
+                context_limit: limit,
+                truncated_count,
+                source_counts,
+                ranked_memories: ranked_before_truncation,
+                reserved_keyword_match_ids: bm25_reserved_ids.into_iter().collect(),
+                context_char_count: context_block.chars().count(),
+            },
+            context_block,
+        })
     }
 
     /// Execute a single tool call (backward-compatible — no LLM/temporal).
@@ -341,6 +487,7 @@ impl ToolExecutor {
             .ok_or_else(|| MemlocalError::InvalidArgument("missing 'content'".into()))?;
         let type_str = args["memory_type"].as_str().unwrap_or("factual");
         let user_id = args["user_id"].as_str().map(String::from);
+        let session_id = args["session_id"].as_str().map(String::from);
         let confidence = args["confidence"].as_f64().unwrap_or(0.9);
 
         let memory_type = MemoryType::from_stored_name(type_str);
@@ -387,7 +534,7 @@ impl ToolExecutor {
                     hash: hash.clone(),
                     user_id: user_id.clone(),
                     agent_id: None,
-                    session_id: None,
+                    session_id: session_id.clone().or_else(|| existing.session_id.clone()),
                     metadata: serde_json::json!({"confidence": confidence}),
                     created_at: existing.created_at,
                     updated_at: now,
@@ -415,7 +562,7 @@ impl ToolExecutor {
             hash,
             user_id,
             agent_id: None,
-            session_id: None,
+            session_id,
             metadata: serde_json::json!({"confidence": confidence}),
             created_at: now,
             updated_at: now,
@@ -455,6 +602,7 @@ impl ToolExecutor {
             .as_str()
             .ok_or_else(|| MemlocalError::InvalidArgument("missing 'text'".into()))?;
         let user_id = args["user_id"].as_str();
+        let batch_session_id = args["session_id"].as_str();
         let preserve_source = args["preserve_source"].as_bool().unwrap_or(false);
 
         let llm = ctx.llm_provider.ok_or_else(|| {
@@ -489,6 +637,7 @@ impl ToolExecutor {
         let mut stored = Vec::new();
         let mut skipped = 0;
         let mut updated = 0;
+        let mut extracted_memory_ids = Vec::new();
 
         for item in &extracted {
             let content = match item["content"].as_str() {
@@ -521,6 +670,9 @@ impl ToolExecutor {
             if let Some(uid) = user_id {
                 add_args["user_id"] = serde_json::Value::String(uid.to_string());
             }
+            if let Some(session_id) = batch_session_id {
+                add_args["session_id"] = serde_json::Value::String(session_id.to_string());
+            }
             if let Some(va) = item.get("valid_at") {
                 add_args["valid_at"] = va.clone();
             }
@@ -530,6 +682,9 @@ impl ToolExecutor {
 
             // Delegate to add_memory (which handles dedup)
             let result = self.add_memory(&add_args, ctx)?;
+            if let Some(memory_id) = result["memory_id"].as_str() {
+                extracted_memory_ids.push(memory_id.to_string());
+            }
             match result["status"].as_str() {
                 Some("stored") => stored.push(result),
                 Some("updated") => updated += 1,
@@ -540,6 +695,7 @@ impl ToolExecutor {
 
         // Dual-layer: also store raw text segments as Episodic memories
         let mut raw_stored = 0;
+        let mut raw_memory_ids = Vec::new();
         if preserve_source {
             // Split on double-newlines to get segments (dialog turns, paragraphs, etc.)
             let segments: Vec<&str> = text
@@ -565,24 +721,73 @@ impl ToolExecutor {
                 let seg_id = Uuid::new_v4().to_string();
                 let now = Utc::now();
 
+                // Parse valid_at from [Session N, datetime] header if present
+                let valid_at = parse_session_datetime(segment);
+
                 let seg_item = MemoryItem {
-                    id: seg_id,
+                    id: seg_id.clone(),
                     content: segment.to_string(),
                     memory_type: MemoryType::Episodic,
                     hash: seg_hash,
                     user_id: user_id.map(String::from),
                     agent_id: None,
-                    session_id: None,
-                    metadata: serde_json::json!({"source": "raw_conversation"}),
+                    session_id: batch_session_id.map(String::from),
+                    metadata: serde_json::json!({
+                        "source": "raw_conversation",
+                        "session_id": batch_session_id,
+                    }),
                     created_at: now,
                     updated_at: now,
-                    valid_at: None,
+                    valid_at,
                     invalid_at: None,
                     score: None,
                 };
 
                 self.store.put_memory(&seg_item, &seg_embedding)?;
+
+                // Create edges to similar memories (like extracted memories get)
+                let similar = self.store.search_semantic(&seg_embedding, 3, user_id, None)?;
+                for sim in &similar {
+                    if sim.id == seg_id {
+                        continue;
+                    }
+                    let weight = sim.score.unwrap_or(0.5);
+                    if weight > 0.5 {
+                        let edge = MemoryEdge::new(seg_id.clone(), sim.id.clone(), MemoryRelation::RelatesTo);
+                        let _ = self.store.put_edge(&edge);
+                    }
+                }
+
+                raw_memory_ids.push(seg_id);
                 raw_stored += 1;
+            }
+        }
+
+        if let Some(session_id) = batch_session_id {
+            for raw_id in &raw_memory_ids {
+                for extracted_id in &extracted_memory_ids {
+                    if raw_id == extracted_id {
+                        continue;
+                    }
+
+                    let mut raw_to_extracted = MemoryEdge::new(
+                        raw_id.clone(),
+                        extracted_id.clone(),
+                        MemoryRelation::DuringSession,
+                    );
+                    raw_to_extracted.weight = 1.0;
+                    raw_to_extracted.metadata = serde_json::json!({"session_id": session_id});
+                    let _ = self.store.put_edge(&raw_to_extracted);
+
+                    let mut extracted_to_raw = MemoryEdge::new(
+                        extracted_id.clone(),
+                        raw_id.clone(),
+                        MemoryRelation::DuringSession,
+                    );
+                    extracted_to_raw.weight = 1.0;
+                    extracted_to_raw.metadata = serde_json::json!({"session_id": session_id});
+                    let _ = self.store.put_edge(&extracted_to_raw);
+                }
             }
         }
 
@@ -882,15 +1087,67 @@ impl ToolExecutor {
     }
 }
 
+fn build_query_variants(query: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    push_query_variant(&mut variants, query.to_string());
+
+    for part in decompose_query(query) {
+        push_query_variant(&mut variants, part);
+    }
+
+    if let Some(distilled) = distill_query(query) {
+        push_query_variant(&mut variants, distilled);
+    }
+
+    if let Some(subject_focus) = build_subject_focus_query(query) {
+        push_query_variant(&mut variants, subject_focus);
+    }
+
+    if let Some(temporal_focus) = build_temporal_focus_query(query) {
+        push_query_variant(&mut variants, temporal_focus);
+    }
+
+    for temporal_window in build_temporal_window_queries(query) {
+        push_query_variant(&mut variants, temporal_window);
+    }
+
+    variants
+}
+
+fn push_query_variant(variants: &mut Vec<String>, candidate: String) {
+    let trimmed = candidate.trim();
+    if trimmed.len() < 4 {
+        return;
+    }
+
+    let normalized = normalize_query_for_dedup(trimmed);
+    if variants
+        .iter()
+        .any(|existing| normalize_query_for_dedup(existing) == normalized)
+    {
+        return;
+    }
+
+    variants.push(trimmed.to_string());
+}
+
+fn normalize_query_for_dedup(query: &str) -> String {
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Decompose a multi-topic query into sub-queries for broader retrieval.
 /// "What's Rahul's job and his fitness goal?" → ["Rahul's job", "Rahul's fitness goal"]
 fn decompose_query(query: &str) -> Vec<String> {
-    let lower = query.to_lowercase();
-    // Split on common conjunctions
-    let parts: Vec<&str> = lower
+    let stem = query
         .split(['?', '.'])
         .next()
-        .unwrap_or(&lower)
+        .unwrap_or(query);
+
+    let parts: Vec<&str> = stem
         .split(" and ")
         .flat_map(|s| s.split(" also "))
         .flat_map(|s| s.split(" as well as "))
@@ -903,6 +1160,145 @@ fn decompose_query(query: &str) -> Vec<String> {
     } else {
         vec![query.to_string()]
     }
+}
+
+fn distill_query(query: &str) -> Option<String> {
+    let distilled = query
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .filter(|word| {
+            let lower = word.to_lowercase();
+            word.len() > 2 && !QUERY_STOPWORDS.contains(&lower.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if distilled.is_empty() {
+        None
+    } else {
+        Some(distilled)
+    }
+}
+
+fn build_subject_focus_query(query: &str) -> Option<String> {
+    let names = extract_name_entities(query);
+    let keywords = extract_keywords(query);
+
+    if names.is_empty() || keywords.is_empty() {
+        return None;
+    }
+
+    Some(format!("{} {}", names.join(" "), keywords))
+}
+
+fn build_temporal_focus_query(query: &str) -> Option<String> {
+    if !is_temporal_query(query) {
+        return None;
+    }
+
+    let mut parts = extract_name_entities(query);
+    let keywords = extract_keywords(query);
+    if !keywords.is_empty() {
+        parts.push(keywords);
+    }
+
+    if is_future_leaning_query(query) {
+        parts.push("future plan upcoming reminder".to_string());
+    } else {
+        parts.push("date time event timeline".to_string());
+    }
+
+    Some(parts.join(" "))
+}
+
+fn build_temporal_window_queries(query: &str) -> Vec<String> {
+    if !is_temporal_query(query) {
+        return Vec::new();
+    }
+
+    const MONTHS: &[(&str, &str)] = &[
+        ("January", "january"),
+        ("February", "february"),
+        ("March", "march"),
+        ("April", "april"),
+        ("May", "may"),
+        ("June", "june"),
+        ("July", "july"),
+        ("August", "august"),
+        ("September", "september"),
+        ("October", "october"),
+        ("November", "november"),
+        ("December", "december"),
+    ];
+
+    let lower = query.to_lowercase();
+    let years: Vec<String> = query
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| word.len() == 4 && word.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|word| word.to_string())
+        .collect();
+
+    let mut variants = Vec::new();
+
+    for (month_title, month_lower) in MONTHS {
+        if lower.contains(month_lower) {
+            if years.is_empty() {
+                variants.push(format!("{} date event timeline", month_title));
+            } else {
+                for year in &years {
+                    variants.push(format!("{} {} date event timeline", month_title, year));
+                }
+            }
+        }
+    }
+
+    if lower.contains("summer") {
+        if years.is_empty() {
+            variants.push("June July August summer timeline".to_string());
+        } else {
+            for year in &years {
+                variants.push(format!("June July August {} summer timeline", year));
+            }
+        }
+    }
+
+    if lower.contains("spring") {
+        if years.is_empty() {
+            variants.push("March April May spring timeline".to_string());
+        } else {
+            for year in &years {
+                variants.push(format!("March April May {} spring timeline", year));
+            }
+        }
+    }
+
+    if lower.contains("winter") {
+        if years.is_empty() {
+            variants.push("December January February winter timeline".to_string());
+        } else {
+            for year in &years {
+                variants.push(format!("December January February {} winter timeline", year));
+            }
+        }
+    }
+
+    if lower.contains("fall") || lower.contains("autumn") {
+        if years.is_empty() {
+            variants.push("September October November fall timeline".to_string());
+        } else {
+            for year in &years {
+                variants.push(format!("September October November {} fall timeline", year));
+            }
+        }
+    }
+
+    for year in &years {
+        variants.push(format!("{} date event timeline", year));
+    }
+
+    variants
 }
 
 /// Check if two similar memories have conflicting specific values (numbers, dates, times).
@@ -933,6 +1329,79 @@ const QUERY_STOPWORDS: &[&str] = &[
     "more", "most", "very", "also", "just", "about", "into", "than", "then",
     "there", "here",
 ];
+
+/// Parse a datetime from a `[Session N, H:MM am/pm on D Month, YYYY]` header.
+/// Returns `Some(DateTime<Utc>)` if the pattern matches.
+fn parse_session_datetime(text: &str) -> Option<DateTime<Utc>> {
+    // Look for pattern: [Session N, TIME on DATE]
+    let bracket_start = text.find('[')?;
+    let bracket_end = text.find(']')?;
+    let header = &text[bracket_start + 1..bracket_end];
+
+    // Split on ", " to get "Session N" and "TIME on DATE"
+    let comma_pos = header.find(", ")?;
+    let datetime_part = &header[comma_pos + 2..];
+
+    // Split "H:MM am/pm on D Month, YYYY"
+    let on_pos = datetime_part.find(" on ")?;
+    let time_part = &datetime_part[..on_pos].trim();
+    let date_part = &datetime_part[on_pos + 4..].trim();
+
+    // Parse time
+    let time_tokens: Vec<&str> = time_part.split_whitespace().collect();
+    if time_tokens.len() != 2 {
+        return None;
+    }
+    let hm: Vec<&str> = time_tokens[0].split(':').collect();
+    if hm.len() != 2 {
+        return None;
+    }
+    let mut hour: u32 = hm[0].parse().ok()?;
+    let minute: u32 = hm[1].parse().ok()?;
+    match time_tokens[1].to_lowercase().as_str() {
+        "am" => {
+            if hour == 12 {
+                hour = 0;
+            }
+        }
+        "pm" => {
+            if hour != 12 {
+                hour += 12;
+            }
+        }
+        _ => return None,
+    }
+
+    // Parse date "D Month, YYYY"
+    let date_clean = date_part.replace(',', "");
+    let date_tokens: Vec<&str> = date_clean.split_whitespace().collect();
+    if date_tokens.len() != 3 {
+        return None;
+    }
+    let day: u32 = date_tokens[0].parse().ok()?;
+    let month: u32 = match date_tokens[1].to_lowercase().as_str() {
+        "january" | "jan" => 1,
+        "february" | "feb" => 2,
+        "march" | "mar" => 3,
+        "april" | "apr" => 4,
+        "may" => 5,
+        "june" | "jun" => 6,
+        "july" | "jul" => 7,
+        "august" | "aug" => 8,
+        "september" | "sep" => 9,
+        "october" | "oct" => 10,
+        "november" | "nov" => 11,
+        "december" | "dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = date_tokens[2].parse().ok()?;
+
+    use chrono::NaiveDate;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, 0)?;
+    let naive = chrono::NaiveDateTime::new(date, time);
+    Some(DateTime::from_naive_utc_and_offset(naive, Utc))
+}
 
 /// Extract entity terms from a query for targeted BM25 search.
 /// Produces compound phrases (proper noun + action word) for precise matching.
@@ -985,6 +1454,43 @@ fn extract_entities(query: &str) -> Vec<String> {
     entities
 }
 
+fn extract_name_entities(query: &str) -> Vec<String> {
+    const NON_ENTITY_CAPS: &[&str] = &[
+        "What", "When", "Where", "Who", "How", "Why", "Would", "Did", "Does", "Do",
+        "Is", "Are", "Was", "Were", "Can", "Could", "Should", "May", "If", "In",
+        "On", "At", "The", "A", "An",
+    ];
+    const MONTHS: &[&str] = &[
+        "January", "February", "March", "April", "May", "June", "July", "August",
+        "September", "October", "November", "December",
+    ];
+
+    let mut names = Vec::new();
+    for (index, word) in query.split_whitespace().enumerate() {
+        let cleaned = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if cleaned.len() < 2 {
+            continue;
+        }
+        let first = match cleaned.chars().next() {
+            Some(ch) => ch,
+            None => continue,
+        };
+        if !first.is_uppercase() {
+            continue;
+        }
+        if index == 0 && NON_ENTITY_CAPS.contains(&cleaned) {
+            continue;
+        }
+        if NON_ENTITY_CAPS.contains(&cleaned) || MONTHS.contains(&cleaned) {
+            continue;
+        }
+        if !names.iter().any(|name| name == cleaned) {
+            names.push(cleaned.to_string());
+        }
+    }
+    names
+}
+
 /// Extract keywords from a query by removing stopwords.
 /// Returns a clean BM25 query string. E.g., "What did Melanie paint recently?" → "melanie paint recently"
 fn extract_keywords(query: &str) -> String {
@@ -994,4 +1500,113 @@ fn extract_keywords(query: &str) -> String {
         .filter(|w| w.len() > 2 && !QUERY_STOPWORDS.contains(&w.as_str()))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn is_temporal_query(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    lower.starts_with("when ")
+        || lower.starts_with("how long")
+        || lower.contains(" before ")
+        || lower.contains(" after ")
+        || lower.contains(" recently")
+        || lower.contains(" last ")
+        || lower.contains(" next ")
+        || lower.contains(" soon")
+        || lower.contains(" ago")
+        || lower.contains(" summer")
+        || lower.contains(" winter")
+        || lower.contains(" spring")
+        || lower.contains(" fall")
+}
+
+fn is_future_leaning_query(query: &str) -> bool {
+    let lower = query.to_lowercase();
+    lower.starts_with("would ")
+        || lower.contains(" will ")
+        || lower.contains(" going to ")
+        || lower.contains(" planning ")
+        || lower.contains(" plan ")
+        || lower.contains(" soon")
+        || lower.contains(" next ")
+}
+
+fn apply_query_aware_boosts(items: &mut [MemoryItem], query: &str) {
+    let temporal_focus = is_temporal_query(query);
+    let future_focus = is_future_leaning_query(query);
+    let target_names = extract_name_entities(query);
+    let query_lower = query.to_lowercase();
+
+    for item in items {
+        let mut boost = 1.0;
+        let content_lower = item.content.to_lowercase();
+
+        if temporal_focus {
+            if item.valid_at.is_some() {
+                boost *= 1.2;
+            }
+            if matches!(item.memory_type, MemoryType::Episodic) {
+                boost *= 1.15;
+            }
+            if future_focus && matches!(item.memory_type, MemoryType::Prospective) {
+                boost *= 1.25;
+            }
+            if is_raw_conversation_item(item) {
+                boost *= 1.05;
+            }
+
+            if let Some(valid_at) = item.valid_at {
+                let month_name = valid_at.format("%B").to_string().to_lowercase();
+                let short_month = valid_at.format("%b").to_string().to_lowercase();
+                let year = valid_at.format("%Y").to_string();
+
+                if query_lower.contains(&month_name) || query_lower.contains(&short_month) {
+                    boost *= 1.2;
+                }
+                if query_lower.contains(&year) {
+                    boost *= 1.15;
+                }
+
+                if query_lower.contains("summer")
+                    && matches!(valid_at.month(), 6 | 7 | 8)
+                {
+                    boost *= 1.15;
+                }
+                if query_lower.contains("spring")
+                    && matches!(valid_at.month(), 3 | 4 | 5)
+                {
+                    boost *= 1.15;
+                }
+                if (query_lower.contains("fall") || query_lower.contains("autumn"))
+                    && matches!(valid_at.month(), 9 | 10 | 11)
+                {
+                    boost *= 1.15;
+                }
+                if query_lower.contains("winter")
+                    && matches!(valid_at.month(), 12 | 1 | 2)
+                {
+                    boost *= 1.15;
+                }
+            }
+        }
+
+        let target_match_count = target_names
+            .iter()
+            .filter(|name| content_lower.contains(&name.to_lowercase()))
+            .count();
+        if target_match_count > 0 {
+            boost *= 1.0 + target_match_count as f64 * 0.15;
+        }
+
+        if boost != 1.0 {
+            item.score = Some(item.score.unwrap_or(0.0) * boost);
+        }
+    }
+}
+
+fn is_raw_conversation_item(item: &MemoryItem) -> bool {
+    item.metadata
+        .get("source")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "raw_conversation")
+        .unwrap_or(false)
 }

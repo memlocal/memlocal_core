@@ -19,6 +19,8 @@ pub enum MemoryRelation {
     PrefersOver,
     /// A temporally follows B (sequence / episode chain).
     Follows,
+    /// A occurred during the same conversation session as B.
+    DuringSession,
     /// A is an instance of category B.
     InstanceOf,
     /// A is owned by / belongs to entity B.
@@ -38,6 +40,7 @@ impl MemoryRelation {
             Self::PartOf => "part_of",
             Self::PrefersOver => "prefers_over",
             Self::Follows => "follows",
+            Self::DuringSession => "during_session",
             Self::InstanceOf => "instance_of",
             Self::BelongsTo => "belongs_to",
             Self::SimilarTo => "similar_to",
@@ -54,6 +57,7 @@ impl MemoryRelation {
             "part_of" => Self::PartOf,
             "prefers_over" => Self::PrefersOver,
             "follows" => Self::Follows,
+            "during_session" => Self::DuringSession,
             "instance_of" => Self::InstanceOf,
             "belongs_to" => Self::BelongsTo,
             "similar_to" => Self::SimilarTo,

@@ -32,6 +32,19 @@ impl TemporalContext {
         }
     }
 
+    /// Create a context with a specific datetime (for historical conversations).
+    pub fn with_datetime(
+        now_utc: DateTime<Utc>,
+        timezone_offset_minutes: i32,
+        timezone_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            now_utc,
+            timezone_offset_minutes,
+            timezone_name: timezone_name.into(),
+        }
+    }
+
     /// Format for the LLM prompt, e.g.:
     /// `Wednesday, 19 March 2026 16:00 +05:30 (Asia/Kolkata)`
     ///
@@ -113,7 +126,7 @@ locations, and intentions.
 
 For each extracted memory, output a JSON array of objects. Each object must
 have these fields:
-- "content": a single, self-contained factual statement (3rd person: "The user ...")
+- "content": a single, self-contained factual statement
 - "type": one of: episodic, semantic, factual, procedural, social, spatial, prospective, affective
 - "confidence": a number from 0.0 to 1.0 indicating certainty
 
@@ -137,6 +150,14 @@ Confidence guidelines:
 - 0.5-0.8: Reasonable inferences
 - <0.5: Speculative; prefer not to extract
 
+CRITICAL — SPEAKER IDENTITY:
+The text may be a conversation between two or more named speakers.
+Do NOT flatten all speakers to "The user". Use the ACTUAL SPEAKER NAME:
+- If "Caroline: I love abstract art" → "Caroline loves abstract art"
+- If "Melanie: My kids really like dinosaurs" → "Melanie's kids like dinosaurs"
+- If a single user is speaking (no named speakers), use "The user ..."
+Always attribute facts, opinions, and experiences to the correct named speaker.
+
 CRITICAL — Temporal resolution rules:
 You will be given CURRENT DATE AND TIME with timezone. Use it to resolve ALL relative references:
 - "tomorrow" = today + 1 day, preserve timezone. Convert to UTC for valid_at.
@@ -147,7 +168,9 @@ You will be given CURRENT DATE AND TIME with timezone. Use it to resolve ALL rel
 - "last week" = 7 days ago from today.
 ALL valid_at/invalid_at MUST be in UTC with Z suffix. Do the timezone math carefully.
 When content contains relative dates, REWRITE the content with the resolved absolute date:
-  "Meeting with X tomorrow at 9pm" → "The user has a meeting with X on Thursday, 20 March 2026 at 21:00 IST (15:30 UTC)"
+  "Meeting with X tomorrow at 9pm" → "Caroline has a meeting with X on Thursday, 20 March 2026 at 21:00 IST (15:30 UTC)"
+When the text includes session timestamps like [Session N, datetime], use that datetime
+as the anchor for the event. Set valid_at to the session datetime converted to UTC.
 
 CRITICAL — PRESERVE EXACT WORDING:
 When extracting, you MUST keep the exact original words for:
@@ -156,11 +179,11 @@ When extracting, you MUST keep the exact original words for:
 - Numbers and amounts: "$45,000" NOT "around 45K", "3:30pm" NOT "afternoon"
 - Specific terms: "fusion curry" NOT "experimental cooking", "half-marathon" NOT "running goal"
 - Place names, company names, product names: keep exactly as stated
-The extracted content MUST contain the SAME specific words the user used.
+The extracted content MUST contain the SAME specific words the speaker used.
 
 Rules:
 1. Each memory must be atomic — one fact per item.
-2. Write content in third person ("The user ...") but PRESERVE all specific nouns, numbers, and terms verbatim.
+2. Use the speaker's actual name (not "The user") when names are present in the text.
 3. If you see temporal references, ALWAYS resolve them and include valid_at/invalid_at.
 4. For preferences, use factual type.
 5. For emotions/moods, use affective type.

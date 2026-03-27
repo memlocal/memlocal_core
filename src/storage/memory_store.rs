@@ -245,6 +245,41 @@ impl MemoryStore {
         rows_to_items(&result)
     }
 
+    /// Get memories for a specific session, ordered by event time when available.
+    pub fn get_memories_by_session(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MemoryItem>> {
+        let mut conditions = vec![format!(
+            "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, created_at, updated_at, \
+             event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
+            MemorySchema::MEMORIES
+        )];
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+
+        conditions.push("session_id == $sid".into());
+        params.insert("sid".into(), DataValue::Str(session_id.into()));
+
+        if let Some(uid) = user_id {
+            conditions.push("user_id == $uid".into());
+            params.insert("uid".into(), DataValue::Str(uid.into()));
+        }
+
+        let script = format!(
+            "?[id, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, created_at, updated_at, valid_at, invalid_at] := \
+             {}\n:order valid_at, -updated_at\n:limit {}",
+            conditions.join(", "),
+            limit
+        );
+
+        let result = self.run_immutable(&script, params)?;
+        rows_to_items(&result)
+    }
+
     /// Invalidate (soft-delete) a memory using RETRACT validity.
     /// The memory's history is preserved — it just becomes invisible at "NOW".
     pub fn invalidate_memory(&self, id: &str) -> Result<()> {

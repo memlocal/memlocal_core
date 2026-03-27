@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use crate::models::*;
@@ -101,9 +102,11 @@ impl WorkingMemory {
     /// Tiered structure:
     /// 1. Triggered Reminders (highest priority)
     /// 2. User Profile
-    /// 3. Important Memories (deduplicated against relevant set)
-    /// 4. Relevant Memories (grouped by type)
-    /// 5. Focused Items (attention context)
+    /// 3. Top Evidence (highest-ranked query matches)
+    /// 4. Raw Conversation Excerpts (limited, supporting evidence)
+    /// 5. Important Memories (deduplicated against relevant set)
+    /// 6. Supporting Memories (grouped by type)
+    /// 7. Focused Items (attention context)
     pub fn to_context_block(&self) -> String {
         let mut buf = String::new();
 
@@ -130,16 +133,18 @@ impl WorkingMemory {
             }
         }
 
-        // KEY FACTS: BM25 keyword matches displayed prominently at the top
-        // These are high-precision facts that exactly match query keywords
+        // KEY FACTS: BM25 keyword matches displayed prominently at the top.
         if !self.keyword_matches.is_empty() {
             buf.push_str("=== KEY FACTS (exact keyword matches — read these first) ===\n");
             let mut km_seen = HashSet::new();
-            for item in &self.keyword_matches {
+            let mut keyword_matches = self.keyword_matches.clone();
+            sort_by_score_desc(&mut keyword_matches);
+            for item in &keyword_matches {
                 if km_seen.insert(item.id.as_str()) {
                     buf.push_str(&format!(
-                        "- [{}] {}\n",
+                        "- [{}{}] {}\n",
                         item.memory_type.display_name(),
+                        format_temporal_tag(item),
                         item.content
                     ));
                 }
@@ -156,19 +161,48 @@ impl WorkingMemory {
                 .unwrap_or(false)
         };
 
-        // Collect raw conversation excerpts from all memory pools
-        let raw_conversations: Vec<&MemoryItem> = self
+        let mut top_evidence: Vec<&MemoryItem> = self
+            .relevant_memories
+            .iter()
+            .filter(|m| !is_raw_conversation(m))
+            .collect();
+        sort_refs_by_score_desc(&mut top_evidence);
+        top_evidence.truncate(8);
+
+        if !top_evidence.is_empty() {
+            buf.push_str("=== TOP EVIDENCE (highest-ranked answer candidates) ===\n");
+            for item in &top_evidence {
+                let score_str = item
+                    .score
+                    .map(|score| format!(" relevance: {score:.2}"))
+                    .unwrap_or_default();
+                let temporal_tag = format_temporal_tag(item);
+                buf.push_str(&format!(
+                    "- [{}{}{}] {}\n",
+                    item.memory_type.display_name(),
+                    temporal_tag,
+                    score_str,
+                    item.content
+                ));
+            }
+            buf.push('\n');
+        }
+
+        // Collect raw conversation excerpts from all memory pools.
+        let mut raw_conversations: Vec<&MemoryItem> = self
             .relevant_memories
             .iter()
             .chain(self.important_memories.iter())
             .filter(|m| is_raw_conversation(m))
             .collect();
+        sort_refs_by_temporal_then_score(&mut raw_conversations);
 
         // Deduplicate raw conversations by ID
         let mut raw_seen = HashSet::new();
         let raw_conversations: Vec<&MemoryItem> = raw_conversations
             .into_iter()
             .filter(|m| raw_seen.insert(m.id.as_str()))
+            .take(5)
             .collect();
 
         if !raw_conversations.is_empty() {
@@ -194,7 +228,7 @@ impl WorkingMemory {
             buf.push('\n');
         }
 
-        // 3. Important memories (deduplicated against relevant set and raw conversations)
+        // 5. Important memories (deduplicated against relevant set and raw conversations)
         let relevant_ids: HashSet<&str> = self
             .relevant_memories
             .iter()
@@ -220,15 +254,17 @@ impl WorkingMemory {
             buf.push('\n');
         }
 
-        // 4. Extracted memories grouped by type (excluding raw conversations)
+        // 6. Supporting memories grouped by type (excluding raw conversations and top evidence)
+        let top_evidence_ids: HashSet<&str> = top_evidence.iter().map(|m| m.id.as_str()).collect();
         let extracted_relevant: Vec<&MemoryItem> = self
             .relevant_memories
             .iter()
             .filter(|m| !is_raw_conversation(m))
+            .filter(|m| !top_evidence_ids.contains(m.id.as_str()))
             .collect();
 
         if !extracted_relevant.is_empty() {
-            buf.push_str("=== EXTRACTED MEMORIES ===\n");
+            buf.push_str("=== SUPPORTING MEMORIES ===\n");
             let mut grouped: std::collections::BTreeMap<&str, Vec<&MemoryItem>> =
                 std::collections::BTreeMap::new();
             for item in &extracted_relevant {
@@ -237,9 +273,12 @@ impl WorkingMemory {
                     .or_default()
                     .push(item);
             }
+            for items in grouped.values_mut() {
+                sort_refs_by_score_desc(items);
+            }
             for (type_name, items) in &grouped {
                 buf.push_str(&format!("{type_name}:\n"));
-                for item in items {
+                for item in items.iter().take(5) {
                     let score_str = match item.score {
                         Some(s) => format!(" (relevance: {s:.2})"),
                         None => String::new(),
@@ -275,6 +314,37 @@ impl WorkingMemory {
         }
 
         buf.trim_end().to_string()
+    }
+}
+
+fn sort_by_score_desc(items: &mut [MemoryItem]) {
+    items.sort_by(|a, b| compare_scores_desc(a, b));
+}
+
+fn sort_refs_by_score_desc(items: &mut [&MemoryItem]) {
+    items.sort_by(|a, b| compare_scores_desc(a, b));
+}
+
+fn sort_refs_by_temporal_then_score(items: &mut [&MemoryItem]) {
+    items.sort_by(|a, b| compare_temporal_then_score(a, b));
+}
+
+fn compare_scores_desc(a: &MemoryItem, b: &MemoryItem) -> Ordering {
+    b.score
+        .unwrap_or(f64::MIN)
+        .partial_cmp(&a.score.unwrap_or(f64::MIN))
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| b.updated_at.cmp(&a.updated_at))
+}
+
+fn compare_temporal_then_score(a: &MemoryItem, b: &MemoryItem) -> Ordering {
+    match (a.valid_at, b.valid_at) {
+        (Some(a_dt), Some(b_dt)) => a_dt
+            .cmp(&b_dt)
+            .then_with(|| compare_scores_desc(a, b)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => compare_scores_desc(a, b),
     }
 }
 
