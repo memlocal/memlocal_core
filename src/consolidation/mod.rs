@@ -1,3 +1,3 @@
 pub mod consolidator;
 
-pub use consolidator::{MemoryConsolidator, Summarizer};
+pub use consolidator::{MemoryConsolidator, SessionSummaryInput, Summarizer};

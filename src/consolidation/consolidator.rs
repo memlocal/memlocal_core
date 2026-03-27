@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -20,9 +21,99 @@ pub trait Summarizer: Send + Sync {
     fn summarize(&self, contents: &[String]) -> Result<String>;
 }
 
+/// Input data for session summarization (the LLM call is done by the platform layer).
+#[derive(Clone, Debug)]
+pub struct SessionSummaryInput {
+    pub session_id: String,
+    pub text: String,
+    pub speakers: Vec<String>,
+    pub key_topics: Vec<String>,
+    pub memory_count: usize,
+}
+
 impl MemoryConsolidator {
     pub fn new(store: Arc<MemoryStore>) -> Self {
         Self { store }
+    }
+
+    /// Find contradicting triples (same subject + predicate, different object).
+    /// Returns pairs of (old_triple, new_triple) where old should be marked not-latest.
+    pub fn find_contradicting_triples(&self) -> Result<Vec<(Triple, Triple)>> {
+        // Get all triples (None filters = no filter)
+        let all_triples = self.store.search_triples(None, None, None)?;
+
+        let mut by_sp: HashMap<(String, String), Vec<Triple>> = HashMap::new();
+        for triple in all_triples {
+            let key = (triple.subject.clone(), triple.predicate.clone());
+            by_sp.entry(key).or_default().push(triple);
+        }
+
+        let mut contradictions = Vec::new();
+        for (_key, mut triples) in by_sp {
+            if triples.len() > 1 {
+                // Sort by last_mentioned descending -- newest is the "latest"
+                triples.sort_by(|a, b| {
+                    b.last_mentioned
+                        .partial_cmp(&a.last_mentioned)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let newest = &triples[0];
+                for old in &triples[1..] {
+                    if old.object != newest.object {
+                        contradictions.push((old.clone(), newest.clone()));
+                    }
+                }
+            }
+        }
+        Ok(contradictions)
+    }
+
+    /// Summarize a session's memories into a SessionSummaryInput.
+    /// The actual LLM call is done by the caller -- this method gathers the memories
+    /// and returns the text to be summarized, plus speaker/topic metadata.
+    pub fn prepare_session_for_summarization(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<Option<SessionSummaryInput>> {
+        let memories = self.store.get_memories_by_session(session_id, user_id, 50)?;
+        if memories.is_empty() {
+            return Ok(None);
+        }
+
+        // Collect speakers from memory metadata
+        let mut speakers = BTreeSet::new();
+        let mut topics = BTreeSet::new();
+        let mut text_parts = Vec::new();
+
+        for m in &memories {
+            let speaker = m.speaker();
+            if !speaker.is_empty() {
+                speakers.insert(speaker.to_string());
+            }
+            // Extract key topics from the content (simple heuristic: capitalized words > 3 chars)
+            for word in m.content.split_whitespace() {
+                let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if trimmed.len() > 3
+                    && trimmed
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                {
+                    topics.insert(trimmed.to_string());
+                }
+            }
+            text_parts.push(m.content.clone());
+        }
+
+        Ok(Some(SessionSummaryInput {
+            session_id: session_id.to_string(),
+            text: text_parts.join("\n"),
+            speakers: speakers.into_iter().collect(),
+            key_topics: topics.into_iter().take(10).collect(),
+            memory_count: memories.len(),
+        }))
     }
 
     /// Find clusters of episodic memories eligible for consolidation.
