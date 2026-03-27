@@ -27,6 +27,12 @@ pub enum MemoryRelation {
     BelongsTo,
     /// A is similar to B (auto-discovered via embedding proximity).
     SimilarTo,
+    /// A updates B (new info contradicts old -- B.is_latest becomes false).
+    Updates,
+    /// A extends B (adds detail without contradiction -- both remain valid).
+    Extends,
+    /// A is derived from B + C (second-order inference).
+    DerivedFrom,
 }
 
 impl MemoryRelation {
@@ -44,6 +50,9 @@ impl MemoryRelation {
             Self::InstanceOf => "instance_of",
             Self::BelongsTo => "belongs_to",
             Self::SimilarTo => "similar_to",
+            Self::Updates => "updates",
+            Self::Extends => "extends",
+            Self::DerivedFrom => "derived_from",
         }
     }
 
@@ -61,6 +70,9 @@ impl MemoryRelation {
             "instance_of" => Self::InstanceOf,
             "belongs_to" => Self::BelongsTo,
             "similar_to" => Self::SimilarTo,
+            "updates" => Self::Updates,
+            "extends" => Self::Extends,
+            "derived_from" => Self::DerivedFrom,
             _ => Self::RelatesTo,
         }
     }

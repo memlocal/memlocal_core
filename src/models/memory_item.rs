@@ -127,6 +127,24 @@ impl MemoryItem {
         self.score = Some(score);
         self
     }
+
+    pub fn reinforcement_count(&self) -> u64 {
+        self.metadata.get("reinforcement_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+    }
+
+    pub fn is_latest(&self) -> bool {
+        self.metadata.get("is_latest")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
+    pub fn speaker(&self) -> &str {
+        self.metadata.get("speaker")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    }
 }
 
 fn empty_to_none(s: Option<&str>) -> Option<String> {

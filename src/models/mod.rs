@@ -12,6 +12,8 @@ pub mod memory_type;
 pub mod message;
 pub mod prospective_item;
 pub mod search_mode;
+pub mod session_summary;
+pub mod triple;
 pub mod user_profile;
 
 pub use add_result::*;
@@ -28,4 +30,6 @@ pub use memory_type::*;
 pub use message::*;
 pub use prospective_item::*;
 pub use search_mode::*;
+pub use session_summary::*;
+pub use triple::*;
 pub use user_profile::*;
