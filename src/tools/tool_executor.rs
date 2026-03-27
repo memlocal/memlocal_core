@@ -505,10 +505,28 @@ impl ToolExecutor {
         // 1. Exact dedup by content hash
         let hash = MemoryItem::compute_hash(content);
         if let Some(existing) = self.store.find_by_hash(&hash, user_id.as_deref())? {
+            // Reinforcement: bump count even for exact duplicates
+            let mut metadata = existing.metadata.clone();
+            let current_count = metadata.get("reinforcement_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert("reinforcement_count".to_string(), serde_json::json!(current_count + 1));
+                obj.insert("last_reinforced_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+            }
+            // Re-embed and update (to persist the metadata change)
+            let embedding = ctx.embedding_provider.embed_one(content)?;
+            let updated = MemoryItem {
+                metadata,
+                updated_at: Utc::now(),
+                ..existing.clone()
+            };
+            self.store.put_memory(&updated, &embedding)?;
+
             return Ok(serde_json::json!({
-                "status": "duplicate",
+                "status": "reinforced",
                 "memory_id": existing.id,
-                "reason": "exact content match"
+                "reason": "exact content match, reinforcement count incremented"
             }));
         }
 
@@ -527,6 +545,24 @@ impl ToolExecutor {
             if is_near_duplicate || is_conflicting {
                 // Update the existing memory instead of adding a duplicate
                 let now = Utc::now();
+                // Increment reinforcement count
+                let mut metadata = existing.metadata.clone();
+                let current_count = metadata.get("reinforcement_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("reinforcement_count".to_string(), serde_json::json!(current_count + 1));
+                    obj.insert("last_reinforced_at".to_string(), serde_json::json!(now.to_rfc3339()));
+                    obj.insert("confidence".to_string(), serde_json::json!(confidence));
+                }
+                // Preserve speaker if provided
+                if let Some(speaker) = args.get("speaker").and_then(|v| v.as_str()) {
+                    if !speaker.is_empty() {
+                        if let Some(obj) = metadata.as_object_mut() {
+                            obj.insert("speaker".to_string(), serde_json::json!(speaker));
+                        }
+                    }
+                }
                 let updated = MemoryItem {
                     id: existing.id.clone(),
                     content: content.to_string(),
@@ -535,7 +571,7 @@ impl ToolExecutor {
                     user_id: user_id.clone(),
                     agent_id: None,
                     session_id: session_id.clone().or_else(|| existing.session_id.clone()),
-                    metadata: serde_json::json!({"confidence": confidence}),
+                    metadata,
                     created_at: existing.created_at,
                     updated_at: now,
                     valid_at,
@@ -555,6 +591,12 @@ impl ToolExecutor {
         // 3. Store as new
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
+        let mut metadata = serde_json::json!({"confidence": confidence});
+        if let Some(speaker) = args.get("speaker").and_then(|v| v.as_str()) {
+            if !speaker.is_empty() {
+                metadata["speaker"] = serde_json::json!(speaker);
+            }
+        }
         let item = MemoryItem {
             id: id.clone(),
             content: content.to_string(),
@@ -563,7 +605,7 @@ impl ToolExecutor {
             user_id,
             agent_id: None,
             session_id,
-            metadata: serde_json::json!({"confidence": confidence}),
+            metadata,
             created_at: now,
             updated_at: now,
             valid_at,
@@ -630,9 +672,30 @@ impl ToolExecutor {
             json_text.to_string()
         };
 
-        let extracted: Vec<serde_json::Value> = serde_json::from_str(&json_text).map_err(|e| {
+        let response_obj: serde_json::Value = serde_json::from_str(&json_text).map_err(|e| {
             MemlocalError::Internal(format!("Failed to parse extraction response: {e}"))
         })?;
+
+        // Handle both old format (array) and new format (object) for backwards compat
+        let (extracted, session_summary, speakers_detected) = if response_obj.is_array() {
+            // Old format: flat array
+            let arr: Vec<serde_json::Value> = serde_json::from_value(response_obj).unwrap_or_default();
+            (arr, None, Vec::new())
+        } else {
+            // New format: structured object
+            let memories = response_obj.get("memories")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let summary = response_obj.get("session_summary")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let speakers: Vec<String> = response_obj.get("speakers_detected")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            (memories, summary, speakers)
+        };
 
         let mut stored = Vec::new();
         let mut skipped = 0;
@@ -646,6 +709,11 @@ impl ToolExecutor {
             };
             let type_str = item["type"].as_str().unwrap_or("factual");
             let confidence = item["confidence"].as_f64().unwrap_or(0.8);
+
+            // Extract new structured fields
+            let speaker = item.get("speaker").and_then(|v| v.as_str()).unwrap_or("");
+            let triple_obj = item.get("triple");
+            let contradicts_pattern = item.get("contradicts_pattern").and_then(|v| v.as_str());
 
             // Skip low-confidence extractions
             if confidence < 0.5 {
@@ -679,16 +747,80 @@ impl ToolExecutor {
             if let Some(ia) = item.get("invalid_at") {
                 add_args["invalid_at"] = ia.clone();
             }
+            if !speaker.is_empty() {
+                add_args["speaker"] = serde_json::json!(speaker);
+            }
 
             // Delegate to add_memory (which handles dedup)
             let result = self.add_memory(&add_args, ctx)?;
             if let Some(memory_id) = result["memory_id"].as_str() {
                 extracted_memory_ids.push(memory_id.to_string());
             }
+
+            // Store triple if present and memory was stored/updated/reinforced
+            if let (Some(memory_id), Some(triple_val)) = (result["memory_id"].as_str(), triple_obj) {
+                if let (Some(subject), Some(predicate), Some(object)) = (
+                    triple_val.get("subject").and_then(|v| v.as_str()),
+                    triple_val.get("predicate").and_then(|v| v.as_str()),
+                    triple_val.get("object").and_then(|v| v.as_str()),
+                ) {
+                    // Check if this triple already exists
+                    let existing_triples = self.store.search_triples(
+                        Some(subject), Some(predicate), Some(object)
+                    ).unwrap_or_default();
+
+                    if existing_triples.is_empty() {
+                        let triple = Triple {
+                            subject: subject.to_string(),
+                            predicate: predicate.to_string(),
+                            object: object.to_string(),
+                            memory_id: memory_id.to_string(),
+                            speaker: speaker.to_string(),
+                            mention_count: 1,
+                            last_mentioned: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                            session_id: batch_session_id.unwrap_or("").to_string(),
+                            confidence,
+                        };
+                        let _ = self.store.put_triple(&triple);
+                    } else {
+                        // Reinforcement: increment mention count
+                        let _ = self.store.increment_triple_mention(
+                            subject, predicate, object,
+                            chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                        );
+                    }
+                }
+            }
+
+            // Handle contradiction detection
+            if let Some(pattern) = contradicts_pattern {
+                let parts: Vec<&str> = pattern.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    let old_triples = self.store.search_triples(Some(parts[0]), Some(parts[1]), None)
+                        .unwrap_or_default();
+
+                    for old_triple in &old_triples {
+                        if old_triple.memory_id != result["memory_id"].as_str().unwrap_or("") {
+                            // Mark old memory as not latest via an Updates edge
+                            if let Ok(Some(_old_memory)) = self.store.get_memory(&old_triple.memory_id) {
+                                if let Some(new_id) = result["memory_id"].as_str() {
+                                    let edge = MemoryEdge::new(
+                                        new_id.to_string(),
+                                        old_triple.memory_id.clone(),
+                                        MemoryRelation::Updates,
+                                    );
+                                    let _ = self.store.put_edge(&edge);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             match result["status"].as_str() {
                 Some("stored") => stored.push(result),
                 Some("updated") => updated += 1,
-                Some("duplicate") => skipped += 1,
+                Some("duplicate") | Some("reinforced") => skipped += 1,
                 _ => stored.push(result),
             }
         }
@@ -791,6 +923,25 @@ impl ToolExecutor {
             }
         }
 
+        // Store session summary in mem_summaries
+        if let Some(summary) = &session_summary {
+            if let Some(sid) = batch_session_id {
+                if let Ok(summary_embedding) = ctx.embedding_provider.embed_one(summary) {
+                    let doc_date = ctx.temporal.map(|t| {
+                        t.now_utc.timestamp_millis() as f64 / 1000.0
+                    }).unwrap_or(0.0);
+                    let _ = self.store.put_summary(
+                        sid,
+                        summary,
+                        &summary_embedding,
+                        &speakers_detected,
+                        &[], // topics extracted from summary could be added later
+                        doc_date,
+                    );
+                }
+            }
+        }
+
         Ok(serde_json::json!({
             "status": "extracted",
             "extracted": extracted.len(),
@@ -798,6 +949,8 @@ impl ToolExecutor {
             "updated": updated,
             "skipped": skipped,
             "raw_preserved": raw_stored,
+            "session_summary": session_summary,
+            "speakers_detected": speakers_detected,
             "memories": stored,
         }))
     }
