@@ -235,6 +235,33 @@ impl ToolExecutor {
                         }
                     }
                 }
+
+                // 2c. Triple-based structured retrieval
+                let query_entities = extract_entities(sq);
+                for entity in &query_entities {
+                    let triples = self.store.search_triples(Some(entity), None, None)
+                        .unwrap_or_default();
+                    for triple in &triples {
+                        if let Ok(Some(memory)) = self.store.get_memory(&triple.memory_id) {
+                            register_item(&memory, &format!("triple:{}", entity));
+                            if seen_ids.insert(memory.id.clone()) {
+                                all_memories.push(memory);
+                            }
+                        }
+                    }
+                }
+
+                // 2d. Triple FTS search
+                let triple_fts_results = self.store.search_triples_fts(sq, 10)
+                    .unwrap_or_default();
+                for triple in &triple_fts_results {
+                    if let Ok(Some(memory)) = self.store.get_memory(&triple.memory_id) {
+                        register_item(&memory, "triple:fts");
+                        if seen_ids.insert(memory.id.clone()) {
+                            all_memories.push(memory);
+                        }
+                    }
+                }
             }
 
             // 3. Entity-focused BM25 search (always runs — primary for bm25_only mode)
@@ -267,6 +294,26 @@ impl ToolExecutor {
                         }
                     }
                     register_item(&item, &format!("bm25:keywords:{keywords}"));
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
+                }
+            }
+        }
+
+        // 5. Session summary retrieval (helps multi-hop and temporal queries)
+        if !bm25_only {
+            let query_emb = embedding_provider.embed_one(query)?;
+            let summaries = self.store.search_summaries(&query_emb, 3)
+                .unwrap_or_default();
+            for summary in &summaries {
+                let session_memories = self.store.get_memories_by_session(
+                    &summary.session_id,
+                    user_id,
+                    15,
+                ).unwrap_or_default();
+                for item in session_memories {
+                    register_item(&item, &format!("summary_session:{}", summary.session_id));
                     if seen_ids.insert(item.id.clone()) {
                         all_memories.push(item);
                     }

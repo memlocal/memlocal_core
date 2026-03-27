@@ -1426,6 +1426,104 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Speaker-filtered semantic search: filters by speaker column BEFORE vector similarity.
+    pub fn search_by_speaker(
+        &self,
+        query_embedding: &[f32],
+        speaker: &str,
+        k: usize,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        let mut filter_parts = vec![format!("speaker == \"{}\"", speaker)];
+        if let Some(uid) = user_id {
+            filter_parts.push(format!("user_id == \"{}\"", uid));
+        }
+        let filter = filter_parts.join(" && ");
+
+        let bind_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                           speaker, document_date, metadata_json, created_at, updated_at, \
+                           event_start: valid_at, event_end: invalid_at";
+        let output_fields = "id, content, type, hash, user_id, agent_id, session_id, \
+                             speaker, document_date, metadata_json, created_at, updated_at, valid_at, invalid_at";
+
+        let script = format!(
+            "?[{output_fields}, distance] := ~{}:{}{{ {bind_fields} | \
+             query: vec($q), k: {k}, ef: {ef}, bind_distance: distance, filter: {filter} }}",
+            MemorySchema::MEMORIES,
+            MemorySchema::VECTOR_INDEX,
+            ef = k * 2,
+        );
+
+        let embedding_dv: Vec<DataValue> = query_embedding
+            .iter()
+            .map(|&f| DataValue::from(f as f64))
+            .collect();
+        let params = BTreeMap::from([("q".into(), DataValue::List(embedding_dv))]);
+
+        let result = self.run_immutable(&script, params)?;
+        let mut items = Vec::new();
+        for i in 0..result.rows.len() {
+            let map = rows_to_json(&result, i);
+            let item = MemoryItem::from_map(&map)?;
+            let raw_score = 1.0 - map["distance"].as_f64().unwrap_or(0.0);
+            let adjusted = Self::apply_confidence(&item, raw_score);
+            items.push(item.with_score(adjusted));
+        }
+        Ok(items)
+    }
+
+    /// Search triples filtered by speaker.
+    pub fn search_triples_by_speaker(
+        &self,
+        query: &str,
+        speaker: &str,
+        k: usize,
+    ) -> Result<Vec<Triple>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(vec![]);
+        }
+        let script = format!(
+            "?[subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence] := \
+             ~{}:{}{{subject, predicate, object, memory_id, speaker, mention_count, \
+             last_mentioned, session_id, confidence | query: $q, k: {} }}, speaker == $speaker",
+            MemorySchema::TRIPLES,
+            MemorySchema::TRIPLES_FTS_INDEX,
+            k
+        );
+        let params = BTreeMap::from([
+            ("q".into(), DataValue::Str(sanitized.into())),
+            ("speaker".into(), DataValue::Str(speaker.into())),
+        ]);
+        // Note: CozoDB FTS may not support post-filter via condition. If it errors, fall back to
+        // search_triples_fts and filter in Rust.
+        match self.run_immutable(&script, params) {
+            Ok(result) => {
+                let mut triples = Vec::new();
+                for row in &result.rows {
+                    triples.push(Triple {
+                        subject: dv_to_string(&row[0]),
+                        predicate: dv_to_string(&row[1]),
+                        object: dv_to_string(&row[2]),
+                        memory_id: dv_to_string(&row[3]),
+                        speaker: dv_to_string(&row[4]),
+                        mention_count: dv_to_i64(&row[5]) as u64,
+                        last_mentioned: dv_to_f64(&row[6]),
+                        session_id: dv_to_string(&row[7]),
+                        confidence: dv_to_f64(&row[8]),
+                    });
+                }
+                Ok(triples)
+            }
+            Err(_) => {
+                // Fallback: search all then filter by speaker
+                let all = self.search_triples_fts(query, k * 2)?;
+                Ok(all.into_iter().filter(|t| t.speaker == speaker).take(k).collect())
+            }
+        }
+    }
+
     /// Get all known speakers (distinct subjects from triples that are people).
     pub fn get_known_speakers(&self, _user_id: Option<&str>) -> Result<Vec<String>> {
         let script = format!(
