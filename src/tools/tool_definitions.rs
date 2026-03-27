@@ -12,6 +12,7 @@ pub mod tool_names {
     pub const ADD_REMINDER: &str = "add_reminder";
     pub const GET_CONTEXT: &str = "get_context";
     pub const ADD_MEMORIES: &str = "add_memories";
+    pub const REQUEST_MORE_CONTEXT: &str = "request_more_context";
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -21,7 +22,7 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
-/// Returns all 9 memory tool definitions in provider-agnostic format.
+/// Returns all 11 memory tool definitions in provider-agnostic format.
 pub fn all_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -257,6 +258,26 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["text"]
+            }),
+        },
+        ToolDefinition {
+            name: tool_names::REQUEST_MORE_CONTEXT.into(),
+            description: "If you're not confident enough to answer, request additional \
+                memory search with a refined query. Use sparingly — only when you \
+                genuinely need more information.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "refined_query": {
+                        "type": "string",
+                        "description": "A more specific search query to find missing information."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of what information is missing."
+                    }
+                },
+                "required": ["refined_query"]
             }),
         },
     ]

@@ -543,6 +543,7 @@ impl ToolExecutor {
             tool_names::GET_RELATIONSHIPS => self.get_relationships(args),
             tool_names::ADD_REMINDER => self.add_reminder(args, ctx.embedding_provider),
             tool_names::GET_CONTEXT => self.get_context(args, ctx.embedding_provider),
+            tool_names::REQUEST_MORE_CONTEXT => self.request_more_context(args, ctx),
             _ => Err(MemlocalError::InvalidArgument(format!(
                 "Unknown tool: {name}"
             ))),
@@ -1311,6 +1312,143 @@ impl ToolExecutor {
             "user_profile": profile.as_ref().map(|p| p.to_summary()),
             "retrieval_time_ms": duration_ms,
         }))
+    }
+
+    // ─────────── request_more_context ───────────
+
+    fn request_more_context(
+        &self,
+        args: &serde_json::Value,
+        ctx: &ExecutionContext,
+    ) -> Result<serde_json::Value> {
+        let query = args["refined_query"]
+            .as_str()
+            .ok_or_else(|| MemlocalError::InvalidArgument("missing 'refined_query'".into()))?;
+        let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+
+        let context = self.prepare_context(
+            query, ctx.embedding_provider, None, Some(15), false
+        )?;
+
+        Ok(serde_json::json!({
+            "status": "additional_context_retrieved",
+            "query": query,
+            "reason": reason,
+            "context": context,
+        }))
+    }
+
+    // ─────────── prepare_context_iterative ───────────
+
+    /// Iterative retrieval: runs 1-2 rounds, using LLM to assess context sufficiency.
+    /// MemMachine's agent-mode pattern: if first retrieval is insufficient, refine queries.
+    pub fn prepare_context_iterative(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        llm_provider: &dyn LlmProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+    ) -> Result<PreparedContext> {
+        // Round 1: Standard retrieval
+        let round1 = self.prepare_context_with_diagnostics(
+            query, embedding_provider, user_id, max_results, false
+        )?;
+
+        // Ask the LLM: is the context sufficient?
+        let sufficiency_prompt = format!(
+            "Query: {}\n\nRetrieved context:\n{}\n\n\
+             Is this sufficient to answer the query? \
+             If NOT, output a JSON array of 1-3 follow-up search queries \
+             that would help fill gaps. If sufficient, output an empty array [].",
+            query,
+            // Truncate context to avoid blowing up token count
+            &round1.context_block[..round1.context_block.len().min(3000)]
+        );
+
+        let refinement = llm_provider.complete(
+            "You are a retrieval sufficiency checker. Output ONLY a JSON array of strings. \
+             No explanation, no markdown.",
+            &sufficiency_prompt
+        )?;
+
+        // Parse refinement queries
+        let refinement_text = refinement.trim();
+        let refinement_text = if refinement_text.starts_with("```") {
+            refinement_text
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.starts_with("```"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            refinement_text.to_string()
+        };
+
+        let sub_queries: Vec<String> = serde_json::from_str(&refinement_text)
+            .unwrap_or_default();
+
+        if sub_queries.is_empty() {
+            return Ok(round1);
+        }
+
+        // Round 2: Search with refined queries
+        let mut combined_ids: HashSet<String> = round1.diagnostics.ranked_memories
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        let mut additional_memories = Vec::new();
+
+        for sq in &sub_queries {
+            let round2 = self.prepare_context_with_diagnostics(
+                sq, embedding_provider, user_id, Some(10), false
+            )?;
+            for mem in round2.diagnostics.ranked_memories {
+                if combined_ids.insert(mem.id.clone()) {
+                    additional_memories.push(mem);
+                }
+            }
+        }
+
+        // If round 2 found new stuff, rebuild context with merged results
+        if additional_memories.is_empty() {
+            return Ok(round1);
+        }
+
+        // Merge: combine round1 memories + additional round2 memories
+        let mut all_ranked = round1.diagnostics.ranked_memories;
+        all_ranked.extend(additional_memories);
+
+        // Re-sort by score and truncate
+        all_ranked.sort_by(|a, b| {
+            b.score.unwrap_or(f64::MIN)
+                .partial_cmp(&a.score.unwrap_or(f64::MIN))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let limit = max_results.unwrap_or(30);
+        all_ranked.truncate(limit);
+
+        // Rebuild context block using the existing pipeline
+        // (Simplest approach: run prepare_context one more time with a combined query)
+        let combined_query = format!("{} {}", query, sub_queries.join(" "));
+        let final_context = self.prepare_context_with_diagnostics(
+            &combined_query, embedding_provider, user_id, max_results, false
+        )?;
+
+        Ok(PreparedContext {
+            context_block: final_context.context_block,
+            diagnostics: PrepareContextDiagnostics {
+                query: query.to_string(),
+                sub_queries,
+                total_unique_retrieved: all_ranked.len(),
+                context_limit: limit,
+                truncated_count: 0,
+                source_counts: final_context.diagnostics.source_counts,
+                ranked_memories: all_ranked,
+                reserved_keyword_match_ids: final_context.diagnostics.reserved_keyword_match_ids,
+                context_char_count: final_context.diagnostics.context_char_count,
+            },
+        })
     }
 }
 

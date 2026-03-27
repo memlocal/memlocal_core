@@ -12,7 +12,7 @@ use crate::longterm;
 use crate::models::*;
 use crate::shortterm::{ConversationBuffer, SensoryBuffer, WorkingMemory};
 use crate::storage::MemoryStore;
-use crate::tools::{EmbeddingProvider, ToolCall, ToolExecutor};
+use crate::tools::{EmbeddingProvider, LlmProvider, ToolCall, ToolExecutor};
 
 /// The main engine — held as an opaque pointer by the platform layer.
 pub struct MemlocalEngine {
@@ -256,6 +256,21 @@ impl MemlocalEngine {
         embedding_provider: &dyn EmbeddingProvider,
     ) -> crate::tools::ToolResult {
         self.tool_executor.execute(tool_call, embedding_provider)
+    }
+
+    /// Prepare context with iterative retrieval (agent mode).
+    /// Uses an LLM to assess context sufficiency and refine queries.
+    pub fn prepare_context_iterative(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        llm_provider: &dyn LlmProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+    ) -> Result<String> {
+        self.tool_executor.prepare_context_iterative(
+            query, embedding_provider, llm_provider, user_id, max_results
+        ).map(|pc| pc.context_block)
     }
 
     // --- Consolidation ---

@@ -8,6 +8,8 @@ pub struct WorkingMemory {
     relevant_memories: Vec<MemoryItem>,
     important_memories: Vec<MemoryItem>,
     keyword_matches: Vec<MemoryItem>,
+    key_triples: Vec<Triple>,
+    session_summaries: Vec<SessionSummary>,
     triggered_reminders: Vec<ProspectiveItem>,
     user_profile: Option<UserProfile>,
     attention_items: Vec<MemoryItem>,
@@ -19,6 +21,8 @@ impl WorkingMemory {
             relevant_memories: Vec::new(),
             important_memories: Vec::new(),
             keyword_matches: Vec::new(),
+            key_triples: Vec::new(),
+            session_summaries: Vec::new(),
             triggered_reminders: Vec::new(),
             user_profile: None,
             attention_items: Vec::new(),
@@ -45,6 +49,14 @@ impl WorkingMemory {
         self.user_profile = profile;
     }
 
+    pub fn set_key_triples(&mut self, triples: Vec<Triple>) {
+        self.key_triples = triples;
+    }
+
+    pub fn set_session_summaries(&mut self, summaries: Vec<SessionSummary>) {
+        self.session_summaries = summaries;
+    }
+
     pub fn focus(&mut self, item: MemoryItem) {
         self.attention_items.retain(|i| i.id != item.id);
         self.attention_items.push(item);
@@ -58,6 +70,8 @@ impl WorkingMemory {
         self.relevant_memories.clear();
         self.important_memories.clear();
         self.keyword_matches.clear();
+        self.key_triples.clear();
+        self.session_summaries.clear();
         self.triggered_reminders.clear();
         self.user_profile = None;
         self.attention_items.clear();
@@ -83,6 +97,14 @@ impl WorkingMemory {
         &self.attention_items
     }
 
+    pub fn key_triples(&self) -> &[Triple] {
+        &self.key_triples
+    }
+
+    pub fn session_summaries(&self) -> &[SessionSummary] {
+        &self.session_summaries
+    }
+
     /// Whether there is any context to inject.
     pub fn has_context(&self) -> bool {
         !self.relevant_memories.is_empty()
@@ -94,6 +116,8 @@ impl WorkingMemory {
                 .map(|p| p.is_not_empty())
                 .unwrap_or(false)
             || !self.keyword_matches.is_empty()
+            || !self.key_triples.is_empty()
+            || !self.session_summaries.is_empty()
             || !self.attention_items.is_empty()
     }
 
@@ -146,6 +170,33 @@ impl WorkingMemory {
                         item.memory_type.display_name(),
                         format_temporal_tag(item),
                         item.content
+                    ));
+                }
+            }
+            buf.push('\n');
+        }
+
+        // KEY FACTS from triples (structured knowledge — highest signal, lowest noise)
+        if !self.key_triples.is_empty() {
+            buf.push_str("=== KEY FACTS (structured knowledge) ===\n");
+            // Group triples by speaker
+            let mut by_speaker: std::collections::BTreeMap<String, Vec<&Triple>> =
+                std::collections::BTreeMap::new();
+            for triple in &self.key_triples {
+                let key = if triple.speaker.is_empty() {
+                    "General".to_string()
+                } else {
+                    triple.speaker.clone()
+                };
+                by_speaker.entry(key).or_default().push(triple);
+            }
+            for (speaker, triples) in &by_speaker {
+                buf.push_str(&format!("  About {}:\n", speaker));
+                for t in triples {
+                    buf.push_str(&format!(
+                        "  - {} {} {} (mentioned {}x, confidence: {:.0}%)\n",
+                        t.subject, t.predicate, t.object, t.mention_count,
+                        t.confidence * 100.0
                     ));
                 }
             }
@@ -228,6 +279,23 @@ impl WorkingMemory {
             buf.push('\n');
         }
 
+        // Session summaries (narrative context for multi-hop questions)
+        if !self.session_summaries.is_empty() {
+            buf.push_str("=== SESSION CONTEXT ===\n");
+            for summary in &self.session_summaries {
+                let speakers = if summary.speakers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", summary.speakers.join(", "))
+                };
+                buf.push_str(&format!(
+                    "- Session {}{}: {}\n",
+                    summary.session_id, speakers, summary.summary
+                ));
+            }
+            buf.push('\n');
+        }
+
         // 5. Important memories (deduplicated against relevant set and raw conversations)
         let relevant_ids: HashSet<&str> = self
             .relevant_memories
@@ -265,36 +333,38 @@ impl WorkingMemory {
 
         if !extracted_relevant.is_empty() {
             buf.push_str("=== SUPPORTING MEMORIES ===\n");
-            let mut grouped: std::collections::BTreeMap<&str, Vec<&MemoryItem>> =
+            // Group by speaker (from metadata), then by type within speaker
+            let mut by_speaker: std::collections::BTreeMap<String, Vec<&MemoryItem>> =
                 std::collections::BTreeMap::new();
             for item in &extracted_relevant {
-                grouped
-                    .entry(item.memory_type.display_name())
-                    .or_default()
-                    .push(item);
+                let speaker_key = item.speaker().to_string();
+                let key = if speaker_key.is_empty() {
+                    "General".to_string()
+                } else {
+                    speaker_key
+                };
+                by_speaker.entry(key).or_default().push(item);
             }
-            for items in grouped.values_mut() {
-                sort_refs_by_score_desc(items);
-            }
-            for (type_name, items) in &grouped {
-                buf.push_str(&format!("{type_name}:\n"));
-                for item in items.iter().take(5) {
+            for (speaker, items) in &by_speaker {
+                buf.push_str(&format!("  {}:\n", speaker));
+                for item in items.iter().take(8) {
                     let score_str = match item.score {
                         Some(s) => format!(" (relevance: {s:.2})"),
                         None => String::new(),
                     };
-                    let confidence_str = item
-                        .metadata
-                        .get("confidence")
-                        .and_then(|v| v.as_f64())
-                        .map(|c| format!(" (confidence: {c:.2})"))
-                        .unwrap_or_default();
                     let temporal_tag = format_temporal_tag(item);
-                    // v5: Add recency annotation so Claude prefers recent info
                     let age = format_age(item.updated_at);
                     buf.push_str(&format!(
-                        "  - [{age}{temporal_tag}] {}{score_str}{confidence_str}\n",
-                        item.content
+                        "    - [{}{}{}] {}{}\n",
+                        item.memory_type.display_name(),
+                        if age.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", {}", age)
+                        },
+                        temporal_tag,
+                        item.content,
+                        score_str,
                     ));
                 }
             }
