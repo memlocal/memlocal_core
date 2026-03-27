@@ -448,9 +448,46 @@ impl ToolExecutor {
             .get_important_memories(user_id, 10, 0.5)
             .unwrap_or_default();
 
+        // Collect triples relevant to the query for structured context
+        let mut key_triples = Vec::new();
+        {
+            let query_entities = extract_entities(query);
+            let mut seen_triples = HashSet::new();
+            for entity in &query_entities {
+                let triples = self.store.search_triples(Some(entity), None, None)
+                    .unwrap_or_default();
+                for t in triples {
+                    let key = format!("{}|{}|{}", t.subject, t.predicate, t.object);
+                    if seen_triples.insert(key) {
+                        key_triples.push(t);
+                    }
+                }
+            }
+            // Also add triples from FTS
+            let fts_triples = self.store.search_triples_fts(query, 15)
+                .unwrap_or_default();
+            for t in fts_triples {
+                let key = format!("{}|{}|{}", t.subject, t.predicate, t.object);
+                if seen_triples.insert(key) {
+                    key_triples.push(t);
+                }
+            }
+            key_triples.truncate(20); // Cap to avoid flooding context
+        }
+
+        // Collect session summaries for narrative context
+        let context_summaries = if !bm25_only {
+            let q_emb = embedding_provider.embed_one(query)?;
+            self.store.search_summaries(&q_emb, 5).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // Assemble using WorkingMemory
         let mut wm = crate::shortterm::WorkingMemory::new();
         wm.set_keyword_matches(keyword_matches);
+        wm.set_key_triples(key_triples);
+        wm.set_session_summaries(context_summaries);
         wm.set_relevant(all_memories);
         wm.set_important(important);
         wm.set_profile(profile);
@@ -876,8 +913,23 @@ impl ToolExecutor {
 
                     for old_triple in &old_triples {
                         if old_triple.memory_id != result["memory_id"].as_str().unwrap_or("") {
-                            // Mark old memory as not latest via an Updates edge
-                            if let Ok(Some(_old_memory)) = self.store.get_memory(&old_triple.memory_id) {
+                            // Mark old memory as not latest + create Updates edge
+                            if let Ok(Some(old_memory)) = self.store.get_memory(&old_triple.memory_id) {
+                                // Write is_latest: false into old memory's metadata
+                                let mut old_meta = old_memory.metadata.clone();
+                                if let Some(obj) = old_meta.as_object_mut() {
+                                    obj.insert("is_latest".to_string(), serde_json::json!(false));
+                                }
+                                let updated_old = MemoryItem {
+                                    metadata: old_meta,
+                                    updated_at: old_memory.updated_at, // preserve original timestamp
+                                    ..old_memory
+                                };
+                                // Re-embed and persist (need embedding for put_memory)
+                                if let Ok(old_emb) = ctx.embedding_provider.embed_one(&updated_old.content) {
+                                    let _ = self.store.put_memory(&updated_old, &old_emb);
+                                }
+
                                 if let Some(new_id) = result["memory_id"].as_str() {
                                     let edge = MemoryEdge::new(
                                         new_id.to_string(),

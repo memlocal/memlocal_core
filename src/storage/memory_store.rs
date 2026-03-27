@@ -454,7 +454,7 @@ impl MemoryStore {
     ) -> Result<Vec<MemoryItem>> {
         let mut filter_parts = Vec::new();
         if let Some(uid) = user_id {
-            filter_parts.push(format!("user_id == \"{uid}\""));
+            filter_parts.push(format!("user_id == \"{}\"", escape_cozo_str(uid)));
         }
         if let Some(mtype) = memory_type {
             filter_parts.push(format!("type == \"{}\"", mtype.stored_name()));
@@ -1435,9 +1435,9 @@ impl MemoryStore {
         k: usize,
         user_id: Option<&str>,
     ) -> Result<Vec<MemoryItem>> {
-        let mut filter_parts = vec![format!("speaker == \"{}\"", speaker)];
+        let mut filter_parts = vec![format!("speaker == \"{}\"", escape_cozo_str(speaker))];
         if let Some(uid) = user_id {
-            filter_parts.push(format!("user_id == \"{}\"", uid));
+            filter_parts.push(format!("user_id == \"{}\"", escape_cozo_str(uid)));
         }
         let filter = filter_parts.join(" && ");
 
@@ -1688,7 +1688,7 @@ impl MemoryStore {
     ) -> Result<Vec<MemoryItem>> {
         let mut filter_parts = Vec::new();
         if let Some(uid) = user_id {
-            filter_parts.push(format!("user_id == \"{}\"", uid));
+            filter_parts.push(format!("user_id == \"{}\"", escape_cozo_str(uid)));
         }
         let filter = if filter_parts.is_empty() {
             String::new()
@@ -1757,6 +1757,11 @@ fn word_overlap(a: &str, b: &str) -> f64 {
     let intersection = words_a.intersection(&words_b).count();
     let smaller = words_a.len().min(words_b.len());
     intersection as f64 / smaller as f64
+}
+
+/// Escape double quotes in a string for safe interpolation into CozoScript filter clauses.
+fn escape_cozo_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn sanitize_fts_query(query: &str) -> String {

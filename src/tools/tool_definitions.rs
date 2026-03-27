@@ -162,7 +162,7 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "relation": {
                         "type": "string",
                         "description": "The type of relationship.",
-                        "enum": ["relates_to", "contradicts", "supersedes", "caused_by", "part_of", "prefers_over", "follows", "instance_of", "belongs_to", "similar_to"]
+                        "enum": ["relates_to", "contradicts", "supersedes", "caused_by", "part_of", "prefers_over", "follows", "instance_of", "belongs_to", "similar_to", "updates", "extends", "derived_from"]
                     },
                     "weight": {
                         "type": "number",
