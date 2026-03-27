@@ -16,12 +16,16 @@ impl MemorySchema {
     pub const CONVERSATIONS: &'static str = "mem_conversations";
     pub const PROFILES: &'static str = "mem_profiles";
     pub const PROSPECTIVE: &'static str = "mem_prospective";
+    pub const TRIPLES: &'static str = "mem_triples";
+    pub const SUMMARIES: &'static str = "mem_summaries";
 
     // ─────────── Index names ───────────
 
     pub const VECTOR_INDEX: &'static str = "mem_vec_idx";
     pub const FTS_INDEX: &'static str = "mem_fts_idx";
     pub const LSH_INDEX: &'static str = "mem_lsh_idx";
+    pub const TRIPLES_FTS_INDEX: &'static str = "mem_triples_fts";
+    pub const SUMMARIES_VECTOR_INDEX: &'static str = "mem_summaries_vec";
 
     /// Generate the DDL for all relations.
     ///
@@ -38,7 +42,9 @@ impl MemorySchema {
             format!(
                 ":create {} {{ id: String, vld: Validity => content: String, type: String, hash: String, \
                  user_id: String default '', agent_id: String default '', \
-                 session_id: String default '', metadata_json: String default '{{}}', \
+                 session_id: String default '', \
+                 speaker: String default '', document_date: Float default 0.0, \
+                 metadata_json: String default '{{}}', \
                  embedding: <F32; {}>, created_at: Float, updated_at: Float, \
                  event_start: Float default 0.0, event_end: Float default 0.0 }}",
                 Self::MEMORIES,
@@ -69,6 +75,26 @@ impl MemorySchema {
                  completed: Int default 0, created_at: Float, \
                  completed_at: Float default 0.0 }}",
                 Self::PROSPECTIVE
+            ),
+            // ── Semantic triples (subject-predicate-object) ──
+            format!(
+                ":create {} {{ subject: String, predicate: String, object: String => \
+                 memory_id: String, speaker: String default '', \
+                 mention_count: Int default 1, \
+                 last_mentioned: Float default 0.0, \
+                 session_id: String default '', \
+                 confidence: Float default 0.8 }}",
+                Self::TRIPLES
+            ),
+            // ── Session summaries ──
+            format!(
+                ":create {} {{ session_id: String => summary: String, \
+                 speakers_json: String default '[]', \
+                 key_topics_json: String default '[]', \
+                 document_date: Float default 0.0, \
+                 embedding: <F32; {}> }}",
+                Self::SUMMARIES,
+                embedding_dim
             ),
         ]
     }
@@ -107,6 +133,30 @@ impl MemorySchema {
              filters: [Lowercase], n_perm: 200, target_threshold: 0.7, n_gram: 3 }}",
             Self::MEMORIES,
             Self::LSH_INDEX
+        )
+    }
+
+    /// FTS index on semantic triples for free-text lookup of subject/predicate/object.
+    pub fn create_triples_fts_index() -> String {
+        format!(
+            "::fts create {}:{}  {{ extractor: [subject, predicate, object], \
+             tokenizer: Simple, \
+             filters: [Lowercase, AlphaNumOnly, Stemmer('english')] }}",
+            Self::TRIPLES,
+            Self::TRIPLES_FTS_INDEX
+        )
+    }
+
+    /// HNSW vector index on session summaries for semantic retrieval.
+    pub fn create_summaries_vector_index(embedding_dim: u32, hnsw_m: u32, hnsw_ef_construction: u32) -> String {
+        format!(
+            "::hnsw create {}:{} {{ dim: {}, m: {}, dtype: F32, \
+             fields: [embedding], distance: Cosine, ef_construction: {} }}",
+            Self::SUMMARIES,
+            Self::SUMMARIES_VECTOR_INDEX,
+            embedding_dim,
+            hnsw_m,
+            hnsw_ef_construction
         )
     }
 
