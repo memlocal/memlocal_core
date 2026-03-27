@@ -158,6 +158,26 @@ impl ToolExecutor {
                 .insert(source.to_string());
         };
 
+        // Speaker-aware query routing
+        let known_speakers = self.store.get_known_speakers(user_id).unwrap_or_default();
+        let target_speaker = detect_query_speaker(query, &known_speakers);
+
+        // If a specific speaker is detected, add speaker-filtered retrieval
+        if let Some(ref speaker) = target_speaker {
+            if !bm25_only {
+                let emb = embedding_provider.embed_one(query)?;
+                let speaker_results = self.store.search_by_speaker(
+                    &emb, speaker, 10, user_id
+                ).unwrap_or_default();
+                for item in speaker_results {
+                    register_item(&item, &format!("speaker_filter:{}", speaker));
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
+                }
+            }
+        }
+
         for sq in &sub_queries {
             let mut session_seed_ids: Vec<String> = Vec::new();
             if !bm25_only {
@@ -349,6 +369,13 @@ impl ToolExecutor {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         bm25_reserved.truncate(15);
+
+        // Apply is_latest penalty: demote superseded facts
+        for item in &mut all_memories {
+            if !item.is_latest() {
+                item.score = Some(item.score.unwrap_or(0.0) * 0.5);
+            }
+        }
 
         // --- Fix 3: Keyword overlap boost ---
         // Boost scores of memories containing exact query keywords
@@ -1285,6 +1312,16 @@ impl ToolExecutor {
             "retrieval_time_ms": duration_ms,
         }))
     }
+}
+
+fn detect_query_speaker(query: &str, known_speakers: &[String]) -> Option<String> {
+    let query_lower = query.to_lowercase();
+    for speaker in known_speakers {
+        if query_lower.contains(&speaker.to_lowercase()) {
+            return Some(speaker.clone());
+        }
+    }
+    None
 }
 
 fn build_query_variants(query: &str) -> Vec<String> {

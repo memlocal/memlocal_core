@@ -421,7 +421,7 @@ impl MemoryStore {
         (-lambda * days_since).exp()
     }
 
-    /// Compute importance: 0.3*confidence + 0.3*log_access + 0.4*recency.
+    /// Compute importance: 0.25*confidence + 0.25*reinforcement + 0.2*log_access + 0.3*recency.
     fn compute_importance(&self, item: &MemoryItem) -> f64 {
         let confidence = item
             .metadata
@@ -433,12 +433,13 @@ impl MemoryStore {
             .get("access_count")
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as f64;
-        let days_since = (chrono::Utc::now() - item.updated_at).num_days() as f64;
+        let reinforcement = item.reinforcement_count() as f64;
 
+        let reinforcement_factor = (1.0 + reinforcement).ln() / (1.0 + 10.0_f64).ln();
         let access_factor = (1.0 + access_count).ln() / (1.0 + 100.0_f64).ln();
-        let recency_factor = (-0.0115 * days_since).exp();
+        let recency_factor = self.time_decay_factor(item);
 
-        0.3 * confidence + 0.3 * access_factor + 0.4 * recency_factor
+        0.25 * confidence + 0.25 * reinforcement_factor + 0.2 * access_factor + 0.3 * recency_factor
     }
 
     // ──────────── Search ────────────
