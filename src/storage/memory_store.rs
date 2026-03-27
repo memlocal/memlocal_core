@@ -534,6 +534,8 @@ impl MemoryStore {
         };
 
         add_ranks(&semantic_list);
+        // BM25 gets 2x weight in RRF — keyword precision is critical for factual recall
+        add_ranks(&text_list);
         add_ranks(&text_list);
         add_ranks(&lsh_list);
 
@@ -705,6 +707,68 @@ impl MemoryStore {
             }
             Err(_) => Ok(vec![]),
         }
+    }
+
+    /// Search memories within a date range on the `event_start` column.
+    /// Filters by ISO 8601 date strings converted to epoch timestamps.
+    /// Optionally scoped to a user_id.
+    pub fn search_temporal(
+        &self,
+        date_from: &str,
+        date_to: &str,
+        k: usize,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        // Parse ISO 8601 strings to epoch timestamps (f64)
+        let from_ts = chrono::DateTime::parse_from_rfc3339(date_from)
+            .or_else(|_| {
+                // Try parsing date-only format by appending time
+                chrono::DateTime::parse_from_rfc3339(&format!("{date_from}T00:00:00Z"))
+            })
+            .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+            .map_err(|e| {
+                MemlocalError::InvalidArgument(format!("invalid date_from '{date_from}': {e}"))
+            })?;
+
+        let to_ts = chrono::DateTime::parse_from_rfc3339(date_to)
+            .or_else(|_| {
+                chrono::DateTime::parse_from_rfc3339(&format!("{date_to}T23:59:59Z"))
+            })
+            .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
+            .map_err(|e| {
+                MemlocalError::InvalidArgument(format!("invalid date_to '{date_to}': {e}"))
+            })?;
+
+        let mut conditions = vec![format!(
+            "*{}{{id, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, created_at, updated_at, \
+             event_start: valid_at, event_end: invalid_at, @ \"NOW\"}}",
+            MemorySchema::MEMORIES
+        )];
+        let mut params: BTreeMap<String, DataValue> = BTreeMap::new();
+
+        // event_start must be within the date range (and non-zero, meaning it was set)
+        conditions.push("valid_at >= $date_from".into());
+        conditions.push("valid_at <= $date_to".into());
+        conditions.push("valid_at > 0.0".into());
+        params.insert("date_from".into(), DataValue::from(from_ts));
+        params.insert("date_to".into(), DataValue::from(to_ts));
+
+        if let Some(uid) = user_id {
+            conditions.push("user_id == $uid".into());
+            params.insert("uid".into(), DataValue::Str(uid.into()));
+        }
+
+        let script = format!(
+            "?[id, content, type, hash, user_id, agent_id, session_id, \
+             metadata_json, created_at, updated_at, valid_at, invalid_at] := \
+             {}\n:order -valid_at\n:limit {}",
+            conditions.join(", "),
+            k
+        );
+
+        let result = self.run_immutable(&script, params)?;
+        rows_to_items(&result)
     }
 
     /// Unified search dispatching to the right mode.

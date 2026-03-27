@@ -3,6 +3,16 @@ use reqwest::blocking::Client;
 use crate::error::{MemlocalError, Result};
 use crate::tools::{LlmProvider, ToolCall, ToolDefinition};
 
+/// Trait for LLM providers that support tool calling.
+/// Used by `run_with_tools()` for agentic multi-turn conversations.
+pub trait ToolCallingLlm: Send + Sync {
+    fn complete_with_tools(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse>;
+}
+
 /// A message in a conversation with an LLM.
 #[derive(Clone, Debug)]
 pub struct LlmMessage {
@@ -274,5 +284,15 @@ impl LlmProvider for AnthropicClient {
     fn complete(&self, system: &str, user: &str) -> Result<String> {
         let resp = self.complete(&[LlmMessage::system(system), LlmMessage::user(user)], &[])?;
         Ok(resp.content)
+    }
+}
+
+impl ToolCallingLlm for AnthropicClient {
+    fn complete_with_tools(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse> {
+        self.complete(messages, tools)
     }
 }

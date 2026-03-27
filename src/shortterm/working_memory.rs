@@ -6,6 +6,7 @@ use crate::models::*;
 pub struct WorkingMemory {
     relevant_memories: Vec<MemoryItem>,
     important_memories: Vec<MemoryItem>,
+    keyword_matches: Vec<MemoryItem>,
     triggered_reminders: Vec<ProspectiveItem>,
     user_profile: Option<UserProfile>,
     attention_items: Vec<MemoryItem>,
@@ -16,6 +17,7 @@ impl WorkingMemory {
         Self {
             relevant_memories: Vec::new(),
             important_memories: Vec::new(),
+            keyword_matches: Vec::new(),
             triggered_reminders: Vec::new(),
             user_profile: None,
             attention_items: Vec::new(),
@@ -28,6 +30,10 @@ impl WorkingMemory {
 
     pub fn set_important(&mut self, items: Vec<MemoryItem>) {
         self.important_memories = items;
+    }
+
+    pub fn set_keyword_matches(&mut self, items: Vec<MemoryItem>) {
+        self.keyword_matches = items;
     }
 
     pub fn set_triggered_reminders(&mut self, reminders: Vec<ProspectiveItem>) {
@@ -50,6 +56,7 @@ impl WorkingMemory {
     pub fn clear(&mut self) {
         self.relevant_memories.clear();
         self.important_memories.clear();
+        self.keyword_matches.clear();
         self.triggered_reminders.clear();
         self.user_profile = None;
         self.attention_items.clear();
@@ -85,6 +92,7 @@ impl WorkingMemory {
                 .as_ref()
                 .map(|p| p.is_not_empty())
                 .unwrap_or(false)
+            || !self.keyword_matches.is_empty()
             || !self.attention_items.is_empty()
     }
 
@@ -116,13 +124,77 @@ impl WorkingMemory {
         // 2. User profile
         if let Some(profile) = &self.user_profile {
             if profile.is_not_empty() {
-                buf.push_str("=== User Profile ===\n");
+                buf.push_str("=== USER PROFILE ===\n");
                 buf.push_str(&profile.to_summary());
                 buf.push('\n');
             }
         }
 
-        // 3. Important memories (deduplicated against relevant set)
+        // KEY FACTS: BM25 keyword matches displayed prominently at the top
+        // These are high-precision facts that exactly match query keywords
+        if !self.keyword_matches.is_empty() {
+            buf.push_str("=== KEY FACTS (exact keyword matches — read these first) ===\n");
+            let mut km_seen = HashSet::new();
+            for item in &self.keyword_matches {
+                if km_seen.insert(item.id.as_str()) {
+                    buf.push_str(&format!(
+                        "- [{}] {}\n",
+                        item.memory_type.display_name(),
+                        item.content
+                    ));
+                }
+            }
+            buf.push('\n');
+        }
+
+        // Separate raw conversation excerpts from extracted memories
+        let is_raw_conversation = |item: &MemoryItem| -> bool {
+            item.metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "raw_conversation")
+                .unwrap_or(false)
+        };
+
+        // Collect raw conversation excerpts from all memory pools
+        let raw_conversations: Vec<&MemoryItem> = self
+            .relevant_memories
+            .iter()
+            .chain(self.important_memories.iter())
+            .filter(|m| is_raw_conversation(m))
+            .collect();
+
+        // Deduplicate raw conversations by ID
+        let mut raw_seen = HashSet::new();
+        let raw_conversations: Vec<&MemoryItem> = raw_conversations
+            .into_iter()
+            .filter(|m| raw_seen.insert(m.id.as_str()))
+            .collect();
+
+        if !raw_conversations.is_empty() {
+            buf.push_str("=== RAW CONVERSATION EXCERPTS ===\n");
+            for item in &raw_conversations {
+                let session_tag = item
+                    .session_id
+                    .as_deref()
+                    .map(|s| format!("Session {s}"))
+                    .unwrap_or_default();
+                let date_tag = item
+                    .valid_at
+                    .map(|dt| dt.format("%-d %b %Y").to_string())
+                    .unwrap_or_default();
+                let prefix = match (session_tag.is_empty(), date_tag.is_empty()) {
+                    (false, false) => format!("[{session_tag}, {date_tag}] "),
+                    (false, true) => format!("[{session_tag}] "),
+                    (true, false) => format!("[{date_tag}] "),
+                    (true, true) => String::new(),
+                };
+                buf.push_str(&format!("{prefix}{}\n", item.content));
+            }
+            buf.push('\n');
+        }
+
+        // 3. Important memories (deduplicated against relevant set and raw conversations)
         let relevant_ids: HashSet<&str> = self
             .relevant_memories
             .iter()
@@ -132,25 +204,34 @@ impl WorkingMemory {
             .important_memories
             .iter()
             .filter(|m| !relevant_ids.contains(m.id.as_str()))
+            .filter(|m| !is_raw_conversation(m))
             .collect();
         if !unique_important.is_empty() {
             buf.push_str("=== Important Memories ===\n");
             for item in unique_important {
+                let temporal_tag = format_temporal_tag(item);
                 buf.push_str(&format!(
-                    "- [{}] {}\n",
+                    "- [{}{}] {}\n",
                     item.memory_type.display_name(),
+                    temporal_tag,
                     item.content
                 ));
             }
             buf.push('\n');
         }
 
-        // 4. Relevant memories grouped by type
-        if !self.relevant_memories.is_empty() {
-            buf.push_str("=== Relevant Memories ===\n");
+        // 4. Extracted memories grouped by type (excluding raw conversations)
+        let extracted_relevant: Vec<&MemoryItem> = self
+            .relevant_memories
+            .iter()
+            .filter(|m| !is_raw_conversation(m))
+            .collect();
+
+        if !extracted_relevant.is_empty() {
+            buf.push_str("=== EXTRACTED MEMORIES ===\n");
             let mut grouped: std::collections::BTreeMap<&str, Vec<&MemoryItem>> =
                 std::collections::BTreeMap::new();
-            for item in &self.relevant_memories {
+            for item in &extracted_relevant {
                 grouped
                     .entry(item.memory_type.display_name())
                     .or_default()
@@ -163,9 +244,19 @@ impl WorkingMemory {
                         Some(s) => format!(" (relevance: {s:.2})"),
                         None => String::new(),
                     };
+                    let confidence_str = item
+                        .metadata
+                        .get("confidence")
+                        .and_then(|v| v.as_f64())
+                        .map(|c| format!(" (confidence: {c:.2})"))
+                        .unwrap_or_default();
+                    let temporal_tag = format_temporal_tag(item);
                     // v5: Add recency annotation so Claude prefers recent info
                     let age = format_age(item.updated_at);
-                    buf.push_str(&format!("  - [{age}] {}{}\n", item.content, score_str));
+                    buf.push_str(&format!(
+                        "  - [{age}{temporal_tag}] {}{score_str}{confidence_str}\n",
+                        item.content
+                    ));
                 }
             }
             buf.push('\n');
@@ -190,6 +281,19 @@ impl WorkingMemory {
 impl Default for WorkingMemory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Format a temporal annotation tag for a memory item.
+/// If `valid_at` is set, returns something like ", event: May 2023".
+/// If not set, returns an empty string.
+fn format_temporal_tag(item: &MemoryItem) -> String {
+    match item.valid_at {
+        Some(dt) => {
+            let formatted = dt.format("%b %Y").to_string();
+            format!(", event: {formatted}")
+        }
+        None => String::new(),
     }
 }
 

@@ -90,6 +90,8 @@ impl ToolExecutor {
         query: &str,
         embedding_provider: &dyn EmbeddingProvider,
         user_id: Option<&str>,
+        max_results: Option<usize>,
+        bm25_only: bool,
     ) -> Result<String> {
         // v5: Query decomposition — split multi-topic queries and search each
         let sub_queries = decompose_query(query);
@@ -97,25 +99,137 @@ impl ToolExecutor {
         let mut seen_ids = std::collections::HashSet::new();
 
         for sq in &sub_queries {
-            let emb = embedding_provider.embed_one(sq)?;
-            // v5: Use deduped search to avoid conflicting versions
-            let results = self
-                .store
-                .search_hybrid_deduped(sq, &emb, 15, user_id, None)?;
-            for item in results {
-                if seen_ids.insert(item.id.clone()) {
-                    all_memories.push(item);
+            if !bm25_only {
+                let emb = embedding_provider.embed_one(sq)?;
+
+                // 1. Per-type retrieval (Engram-style: each type retrieves independently)
+                let type_searches = [
+                    (MemoryType::Episodic, 15),
+                    (MemoryType::Factual, 10),
+                    (MemoryType::Semantic, 8),
+                    (MemoryType::Social, 5),
+                ];
+
+                for (mem_type, k) in &type_searches {
+                    let results =
+                        self.store
+                            .search_hybrid_deduped(sq, &emb, *k, user_id, Some(*mem_type))?;
+                    for item in results {
+                        if seen_ids.insert(item.id.clone()) {
+                            all_memories.push(item);
+                        }
+                    }
+                }
+
+                // 2. Untyped hybrid search as catch-all
+                let results =
+                    self.store
+                        .search_hybrid_deduped(sq, &emb, 10, user_id, None)?;
+                for item in results {
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
+                }
+            }
+
+            // 3. Entity-focused BM25 search (always runs — primary for bm25_only mode)
+            let entities = extract_entities(sq);
+            for entity in &entities {
+                let k = if bm25_only { 20 } else { 15 }; // more BM25 results when it's the only source
+                let results = self.store.search_text(entity, k)?;
+                for item in results {
+                    if let Some(uid) = user_id {
+                        if item.user_id.as_deref() != Some(uid) {
+                            continue;
+                        }
+                    }
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
+                }
+            }
+
+            // 4. Focused keyword BM25 — query stripped of stopwords
+            let keywords = extract_keywords(sq);
+            if !keywords.is_empty() {
+                let k = if bm25_only { 15 } else { 10 };
+                let results = self.store.search_text(&keywords, k)?;
+                for item in results {
+                    if let Some(uid) = user_id {
+                        if item.user_id.as_deref() != Some(uid) {
+                            continue;
+                        }
+                    }
+                    if seen_ids.insert(item.id.clone()) {
+                        all_memories.push(item);
+                    }
                 }
             }
         }
 
-        // Sort by score descending, keep top 20
+        // --- Fix 1: Reserve BM25 slots (guaranteed keyword hits) ---
+        // Collect the top BM25-only hits per entity so they can't be displaced by semantic results
+        let mut bm25_reserved: Vec<MemoryItem> = Vec::new();
+        let mut bm25_reserved_ids = std::collections::HashSet::new();
+        for sq in &sub_queries {
+            let entities = extract_entities(sq);
+            for entity in &entities {
+                let results = self.store.search_text(entity, 3)?;
+                for item in results {
+                    if let Some(uid) = user_id {
+                        if item.user_id.as_deref() != Some(uid) {
+                            continue;
+                        }
+                    }
+                    if bm25_reserved_ids.insert(item.id.clone()) {
+                        bm25_reserved.push(item);
+                    }
+                }
+            }
+        }
+        // Cap reserved slots at 10 to avoid flooding context
+        bm25_reserved.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        bm25_reserved.truncate(10);
+
+        // --- Fix 3: Keyword overlap boost ---
+        // Boost scores of memories containing exact query keywords
+        let query_terms: Vec<String> = extract_keywords(query)
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        if !query_terms.is_empty() {
+            for item in &mut all_memories {
+                let content_lower = item.content.to_lowercase();
+                let matched = query_terms
+                    .iter()
+                    .filter(|t| content_lower.contains(t.as_str()))
+                    .count();
+                if matched > 0 {
+                    let boost = 1.0 + (matched as f64 / query_terms.len() as f64) * 0.5;
+                    item.score = Some(item.score.unwrap_or(0.0) * boost);
+                }
+            }
+        }
+
+        // Sort by boosted score, keep top results
         all_memories.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        all_memories.truncate(20);
+        let limit = max_results.unwrap_or(30);
+        all_memories.truncate(limit);
+
+        // --- Option C: BM25 reserved hits go into a separate priority section ---
+        // These are displayed as "KEY FACTS" at the top of the context block
+        let keyword_matches: Vec<MemoryItem> = bm25_reserved
+            .into_iter()
+            .filter(|item| !seen_ids.contains(&item.id))
+            .collect();
 
         // Get user profile
         let profile = match user_id {
@@ -132,11 +246,12 @@ impl ToolExecutor {
         // Get important memories
         let important = self
             .store
-            .get_important_memories(user_id, 5, 0.6)
+            .get_important_memories(user_id, 10, 0.5)
             .unwrap_or_default();
 
         // Assemble using WorkingMemory
         let mut wm = crate::shortterm::WorkingMemory::new();
+        wm.set_keyword_matches(keyword_matches);
         wm.set_relevant(all_memories);
         wm.set_important(important);
         wm.set_profile(profile);
@@ -340,6 +455,7 @@ impl ToolExecutor {
             .as_str()
             .ok_or_else(|| MemlocalError::InvalidArgument("missing 'text'".into()))?;
         let user_id = args["user_id"].as_str();
+        let preserve_source = args["preserve_source"].as_bool().unwrap_or(false);
 
         let llm = ctx.llm_provider.ok_or_else(|| {
             MemlocalError::InvalidArgument(
@@ -422,12 +538,61 @@ impl ToolExecutor {
             }
         }
 
+        // Dual-layer: also store raw text segments as Episodic memories
+        let mut raw_stored = 0;
+        if preserve_source {
+            // Split on double-newlines to get segments (dialog turns, paragraphs, etc.)
+            let segments: Vec<&str> = text
+                .split("\n\n")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && s.len() > 10) // skip empty/tiny segments
+                .collect();
+
+            for segment in &segments {
+                let seg_hash = MemoryItem::compute_hash(segment);
+                // Skip if exact duplicate already exists
+                if self
+                    .store
+                    .find_by_hash(&seg_hash, user_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    continue;
+                }
+
+                let seg_embedding = ctx.embedding_provider.embed_one(segment)?;
+                let seg_id = Uuid::new_v4().to_string();
+                let now = Utc::now();
+
+                let seg_item = MemoryItem {
+                    id: seg_id,
+                    content: segment.to_string(),
+                    memory_type: MemoryType::Episodic,
+                    hash: seg_hash,
+                    user_id: user_id.map(String::from),
+                    agent_id: None,
+                    session_id: None,
+                    metadata: serde_json::json!({"source": "raw_conversation"}),
+                    created_at: now,
+                    updated_at: now,
+                    valid_at: None,
+                    invalid_at: None,
+                    score: None,
+                };
+
+                self.store.put_memory(&seg_item, &seg_embedding)?;
+                raw_stored += 1;
+            }
+        }
+
         Ok(serde_json::json!({
             "status": "extracted",
             "extracted": extracted.len(),
             "stored": stored.len(),
             "updated": updated,
             "skipped": skipped,
+            "raw_preserved": raw_stored,
             "memories": stored,
         }))
     }
@@ -462,7 +627,7 @@ impl ToolExecutor {
             None
         };
 
-        let items = self.store.search(
+        let mut items = self.store.search(
             query,
             embedding.as_deref(),
             mode,
@@ -470,6 +635,26 @@ impl ToolExecutor {
             user_id,
             memory_type,
         )?;
+
+        // Temporal search: if date params provided, run temporal search and merge results
+        let date_from = args["date_from"].as_str();
+        let date_to = args["date_to"].as_str();
+
+        if date_from.is_some() || date_to.is_some() {
+            // Default date_from to epoch, date_to to far-future if only one is provided
+            let df = date_from.unwrap_or("1970-01-01T00:00:00Z");
+            let dt = date_to.unwrap_or("2099-12-31T23:59:59Z");
+
+            if let Ok(temporal_items) = self.store.search_temporal(df, dt, limit, user_id) {
+                let mut seen_ids: std::collections::HashSet<String> =
+                    items.iter().map(|m| m.id.clone()).collect();
+                for item in temporal_items {
+                    if seen_ids.insert(item.id.clone()) {
+                        items.push(item);
+                    }
+                }
+            }
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -733,4 +918,80 @@ fn has_conflicting_specifics(old: &str, new: &str) -> bool {
     let new_nums = extract_nums(new);
     // Both have numeric specifics but they differ → likely a contradiction
     !old_nums.is_empty() && !new_nums.is_empty() && old_nums != new_nums
+}
+
+/// Standard English stopwords for query analysis. Used to identify meaningful
+/// terms when constructing BM25 search phrases. This is NOT a BM25 filter
+/// (CozoDB handles that via IDF) — it's for extracting action words and
+/// compound phrases from user questions.
+const QUERY_STOPWORDS: &[&str] = &[
+    "what", "when", "where", "who", "how", "did", "does", "was", "were", "is",
+    "are", "the", "a", "an", "in", "on", "at", "to", "for", "of", "with",
+    "and", "or", "but", "not", "do", "has", "have", "had", "will", "would",
+    "could", "should", "that", "this", "from", "been", "being", "her", "his",
+    "their", "its", "she", "he", "they", "you", "any", "some", "many", "much",
+    "more", "most", "very", "also", "just", "about", "into", "than", "then",
+    "there", "here",
+];
+
+/// Extract entity terms from a query for targeted BM25 search.
+/// Produces compound phrases (proper noun + action word) for precise matching.
+/// E.g., "What did Melanie paint recently?" → ["Melanie", "Melanie paint", "Melanie recently", "paint", "recently"]
+fn extract_entities(query: &str) -> Vec<String> {
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| w.len() >= 2)
+        .collect();
+
+    let mut entities = Vec::new();
+    let mut proper_nouns = Vec::new();
+    let mut significant_words = Vec::new();
+
+    for (i, word) in words.iter().enumerate() {
+        let lower = word.to_lowercase();
+        if QUERY_STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+
+        // Proper nouns: capitalized, not first word
+        if i > 0 && word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+            proper_nouns.push(word.to_string());
+        }
+
+        // Significant words: >3 chars, not stopword
+        if lower.len() > 3 {
+            significant_words.push(lower);
+        }
+    }
+
+    // 1. Compound phrases: each proper noun + each significant word
+    for noun in &proper_nouns {
+        entities.push(noun.clone()); // standalone proper noun
+        for sig in &significant_words {
+            if sig.to_lowercase() != noun.to_lowercase() {
+                entities.push(format!("{} {}", noun, sig)); // "Melanie paint"
+            }
+        }
+    }
+
+    // 2. Significant words as standalone BM25 terms
+    for sig in &significant_words {
+        if !entities.iter().any(|e| e.to_lowercase() == *sig) {
+            entities.push(sig.clone());
+        }
+    }
+
+    entities
+}
+
+/// Extract keywords from a query by removing stopwords.
+/// Returns a clean BM25 query string. E.g., "What did Melanie paint recently?" → "melanie paint recently"
+fn extract_keywords(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| w.len() > 2 && !QUERY_STOPWORDS.contains(&w.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

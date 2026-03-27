@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::tools::{EmbeddingProvider, ToolDefinition, ToolExecutor};
 
-use super::anthropic_client::{AnthropicClient, LlmMessage};
+use super::anthropic_client::{LlmMessage, ToolCallingLlm};
 
 /// Run a full agentic tool-calling loop.
 ///
@@ -15,7 +15,7 @@ use super::anthropic_client::{AnthropicClient, LlmMessage};
 /// The `messages` vec is mutated in place — after this returns, it contains
 /// the full conversation trace including all tool calls and results.
 pub fn run_with_tools(
-    client: &AnthropicClient,
+    client: &dyn ToolCallingLlm,
     messages: &mut Vec<LlmMessage>,
     tools: &[ToolDefinition],
     tool_executor: &ToolExecutor,
@@ -23,7 +23,7 @@ pub fn run_with_tools(
     max_rounds: usize,
 ) -> Result<String> {
     for round in 0..max_rounds {
-        let response = client.complete(messages, tools)?;
+        let response = client.complete_with_tools(messages, tools)?;
 
         if response.has_tool_calls() {
             // Append assistant message with tool calls to the conversation
@@ -51,7 +51,7 @@ pub fn run_with_tools(
     }
 
     // Max rounds exceeded — return whatever we have
-    let last_response = client.complete(messages, &[])?;
+    let last_response = client.complete_with_tools(messages, &[])?;
     messages.push(LlmMessage::assistant(last_response.content.clone(), vec![]));
     Ok(last_response.content)
 }

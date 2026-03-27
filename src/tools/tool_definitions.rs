@@ -78,6 +78,14 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Optional memory type filter.",
                         "enum": ["episodic", "semantic", "factual", "procedural", "social", "spatial", "prospective", "affective"]
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 date to filter results from (e.g. '2023-05-01'). Only returns memories with events on or after this date."
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 date to filter results until (e.g. '2023-05-31'). Only returns memories with events on or before this date."
                     }
                 },
                 "required": ["query"]
@@ -242,6 +250,10 @@ pub fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "user_id": {
                         "type": "string",
                         "description": "Optional user identifier."
+                    },
+                    "preserve_source": {
+                        "type": "boolean",
+                        "description": "If true, also store raw text segments as Episodic memories alongside extracted facts. Recommended for conversation ingestion."
                     }
                 },
                 "required": ["text"]
