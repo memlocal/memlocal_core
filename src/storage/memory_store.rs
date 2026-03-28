@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 use log::debug;
@@ -589,15 +589,46 @@ impl MemoryStore {
         memory_type: Option<MemoryType>,
     ) -> Result<Vec<MemoryItem>> {
         let semantic_list = self.search_semantic(query_embedding, k, user_id, memory_type)?;
-        let text_list = self.search_text(query, k)?;
-        let lsh_list = self.search_lsh(query, k)?;
+        let text_list: Vec<MemoryItem> = self
+            .search_text(query, k)?
+            .into_iter()
+            .filter(|item| {
+                user_id.map(|uid| item.user_id.as_deref() == Some(uid)).unwrap_or(true)
+                    && memory_type.map(|kind| item.memory_type == kind).unwrap_or(true)
+            })
+            .collect();
+        let lsh_list: Vec<MemoryItem> = self
+            .search_lsh(query, k)?
+            .into_iter()
+            .filter(|item| {
+                user_id.map(|uid| item.user_id.as_deref() == Some(uid)).unwrap_or(true)
+                    && memory_type.map(|kind| item.memory_type == kind).unwrap_or(true)
+            })
+            .collect();
 
         const K_RRF: f64 = 60.0;
+        let reserved_bm25 = 5.min(text_list.len()).min(k);
+        let mut final_results = Vec::new();
+        let mut seen_ids = HashSet::new();
+
+        for (rank, item) in text_list.iter().take(reserved_bm25).enumerate() {
+            seen_ids.insert(item.id.clone());
+            final_results.push(item.clone().with_score(1.0 - rank as f64 * 0.05));
+        }
+
+        if final_results.len() >= k {
+            final_results.truncate(k);
+            return Ok(final_results);
+        }
+
         let mut rrf_scores: HashMap<String, f64> = HashMap::new();
         let mut item_map: HashMap<String, MemoryItem> = HashMap::new();
 
         let mut add_ranks = |list: &[MemoryItem]| {
             for (rank, item) in list.iter().enumerate() {
+                if seen_ids.contains(&item.id) {
+                    continue;
+                }
                 *rrf_scores.entry(item.id.clone()).or_default() +=
                     1.0 / (K_RRF + rank as f64 + 1.0);
                 item_map
@@ -607,8 +638,6 @@ impl MemoryStore {
         };
 
         add_ranks(&semantic_list);
-        // BM25 gets 2x weight in RRF — keyword precision is critical for factual recall
-        add_ranks(&text_list);
         add_ranks(&text_list);
         add_ranks(&lsh_list);
 
@@ -625,11 +654,15 @@ impl MemoryStore {
 
         final_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(final_scores
-            .into_iter()
-            .take(k)
-            .filter_map(|(id, score)| item_map.remove(&id).map(|item| item.with_score(score)))
-            .collect())
+        let remaining_k = k.saturating_sub(final_results.len());
+        final_results.extend(
+            final_scores
+                .into_iter()
+                .take(remaining_k)
+                .filter_map(|(id, score)| item_map.remove(&id).map(|item| item.with_score(score))),
+        );
+
+        Ok(final_results)
     }
 
     /// v5: Hybrid search with post-search dedup by recency.

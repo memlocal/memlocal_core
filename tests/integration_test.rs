@@ -6,7 +6,10 @@ use uuid::Uuid;
 use memlocal_core::error::Result;
 use memlocal_core::models::*;
 use memlocal_core::storage::MemoryStore;
-use memlocal_core::tools::{EmbeddingProvider, ToolCall, ToolExecutor};
+use memlocal_core::tools::{
+    EmbeddingProvider, ExecutionContext, LlmProvider, RerankerProvider, TemporalContext,
+    ToolCall, ToolExecutor,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Test helpers
@@ -30,6 +33,49 @@ impl EmbeddingProvider for MockEmbedding {
             .bytes()
             .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
         Ok(mock_embedding(seed))
+    }
+}
+
+struct ReverseReranker;
+
+impl RerankerProvider for ReverseReranker {
+    fn rerank(&self, _query: &str, documents: &[String], top_k: usize) -> Result<Vec<(usize, f64)>> {
+        Ok(documents
+            .iter()
+            .enumerate()
+            .rev()
+            .take(top_k)
+            .enumerate()
+            .map(|(rank, (index, _))| (index, 1.0 - rank as f64 * 0.1))
+            .collect())
+    }
+}
+
+struct FailingReranker;
+
+impl RerankerProvider for FailingReranker {
+    fn rerank(&self, _query: &str, _documents: &[String], _top_k: usize) -> Result<Vec<(usize, f64)>> {
+        Err(memlocal_core::error::MemlocalError::Internal(
+            "forced reranker failure".to_string(),
+        ))
+    }
+}
+
+struct MockLlm {
+    response: String,
+}
+
+impl MockLlm {
+    fn new(response: &str) -> Self {
+        Self {
+            response: response.to_string(),
+        }
+    }
+}
+
+impl LlmProvider for MockLlm {
+    fn complete(&self, _system: &str, _user: &str) -> Result<String> {
+        Ok(self.response.clone())
     }
 }
 
@@ -410,6 +456,97 @@ fn test_search_hybrid() {
     assert!(!results.is_empty());
     // Hybrid merges FTS + semantic + LSH via RRF, top result should mention Rust
     assert!(results[0].content.contains("Rust"));
+}
+
+#[test]
+fn test_search_hybrid_reserves_bm25_hits_with_filters() {
+    let store = open_store();
+    let embed = MockEmbedding;
+
+    let alice_fact = make_item("Alice moved from Sweden four years ago", Some("alice"), MemoryType::Factual);
+    let bob_fact = make_item("Bob moved from Sweden four years ago", Some("bob"), MemoryType::Factual);
+    let episodic_fact = make_item("Alice visited Sweden on vacation", Some("alice"), MemoryType::Episodic);
+
+    store.put_memory(&alice_fact, &embed.embed_one(&alice_fact.content).unwrap()).unwrap();
+    store.put_memory(&bob_fact, &embed.embed_one(&bob_fact.content).unwrap()).unwrap();
+    store.put_memory(&episodic_fact, &embed.embed_one(&episodic_fact.content).unwrap()).unwrap();
+
+    let query_emb = embed.embed_one("Where did Alice move from?").unwrap();
+    let results = store
+        .search_hybrid("Sweden", &query_emb, 3, Some("alice"), Some(MemoryType::Factual))
+        .unwrap();
+
+    assert!(!results.is_empty());
+    assert!(results[0].content.contains("Alice moved from Sweden"));
+    assert!(results.iter().all(|item| item.user_id.as_deref() == Some("alice")));
+    assert!(results.iter().all(|item| item.memory_type == MemoryType::Factual));
+}
+
+#[test]
+fn test_prepare_context_reranked_updates_diagnostics() {
+    let store = open_store();
+    let embed = MockEmbedding;
+    let executor = ToolExecutor::new(Arc::clone(&store));
+
+    for content in [
+        "Alice enjoys painting landscapes",
+        "Alice likes pottery classes on weekends",
+        "Alice moved from Sweden four years ago",
+    ] {
+        let item = make_item(content, Some("alice"), MemoryType::Factual);
+        let emb = embed.embed_one(content).unwrap();
+        store.put_memory(&item, &emb).unwrap();
+    }
+
+    let prepared = executor
+        .prepare_context_with_diagnostics_reranked(
+            "What does Alice do?",
+            &embed,
+            Some("alice"),
+            Some(5),
+            false,
+            Some(&ReverseReranker),
+        )
+        .unwrap();
+
+    assert!(!prepared.diagnostics.ranked_memories.is_empty());
+    let top = &prepared.diagnostics.ranked_memories[0];
+    assert!(top.pre_rerank_rank.unwrap_or(1) > 1);
+    assert!(top.rerank_score.is_some());
+}
+
+#[test]
+fn test_prepare_context_reranked_falls_back_on_error() {
+    let store = open_store();
+    let embed = MockEmbedding;
+    let executor = ToolExecutor::new(Arc::clone(&store));
+
+    for content in [
+        "Alice enjoys painting landscapes",
+        "Alice likes pottery classes on weekends",
+    ] {
+        let item = make_item(content, Some("alice"), MemoryType::Factual);
+        let emb = embed.embed_one(content).unwrap();
+        store.put_memory(&item, &emb).unwrap();
+    }
+
+    let prepared = executor
+        .prepare_context_with_diagnostics_reranked(
+            "What does Alice like?",
+            &embed,
+            Some("alice"),
+            Some(5),
+            false,
+            Some(&FailingReranker),
+        )
+        .unwrap();
+
+    assert!(!prepared.context_block.is_empty());
+    assert!(prepared
+        .diagnostics
+        .ranked_memories
+        .iter()
+        .all(|memory| memory.rerank_score.is_none()));
 }
 
 #[test]
@@ -869,6 +1006,133 @@ fn test_tool_full_workflow() {
     assert!(executor.execute(&del, &embed).success);
 
     println!("✓ Full workflow test passed: add → relate → search → context → filter → delete");
+}
+
+#[test]
+fn test_tool_add_memories_stores_observations_without_duplicates() {
+    let store = open_store();
+    let executor = ToolExecutor::new(Arc::clone(&store));
+    let embed = MockEmbedding;
+    let llm = MockLlm::new(
+        r#"{
+            "memories": [
+                {
+                    "content": "Caroline attended a pride parade",
+                    "type": "episodic",
+                    "confidence": 0.94,
+                    "speaker": "Caroline",
+                    "triple": {
+                        "subject": "Caroline",
+                        "predicate": "attended",
+                        "object": "a pride parade"
+                    },
+                    "contradicts_pattern": null
+                }
+            ],
+            "observations": [
+                {
+                    "content": "Caroline is dating Stefan",
+                    "speaker": "Caroline",
+                    "confidence": 0.93
+                },
+                {
+                    "content": "Caroline is dating Stefan",
+                    "speaker": "Caroline",
+                    "confidence": 0.92
+                },
+                {
+                    "content": "Melanie's kids like dinosaurs and nature",
+                    "speaker": "Melanie",
+                    "confidence": 0.89
+                }
+            ],
+            "session_summary": "Caroline and Melanie discussed family life and recent events.",
+            "speakers_detected": ["Caroline", "Melanie"]
+        }"#,
+    );
+    let temporal = TemporalContext::ist();
+    let ctx = ExecutionContext::full(&embed, &llm, &temporal);
+    let call = make_tool_call(
+        "add_memories",
+        serde_json::json!({
+            "text": "Caroline: I'm dating Stefan.\nMelanie: My kids like dinosaurs and nature.\nCaroline: I attended a pride parade.",
+            "user_id": "conv26",
+            "session_id": "sess-1",
+            "preserve_source": false
+        }),
+    );
+
+    let first = executor.execute_with_context(&call, &ctx);
+    assert!(first.success, "add_memories failed: {}", first.content);
+
+    let first_parsed: serde_json::Value = serde_json::from_str(&first.content).unwrap();
+    assert_eq!(first_parsed["status"], "extracted");
+    assert_eq!(first_parsed["extracted"], 1);
+    assert_eq!(first_parsed["observations_extracted"], 3);
+    assert_eq!(
+        first_parsed["speakers_detected"],
+        serde_json::json!(["Caroline", "Melanie"])
+    );
+
+    let summaries = store
+        .search_summaries(&embed.embed_one("Caroline and Melanie").unwrap(), 5)
+        .unwrap();
+    assert!(!summaries.is_empty());
+    assert_eq!(summaries[0].session_id, "sess-1");
+
+    let factual = store
+        .get_memories(Some("conv26"), Some(MemoryType::Factual), 20)
+        .unwrap();
+    let observation_memories: Vec<_> = factual
+        .iter()
+        .filter(|memory| {
+            memory
+                .metadata
+                .get("observation")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+        .collect();
+    assert_eq!(observation_memories.len(), 2);
+    assert!(observation_memories
+        .iter()
+        .any(|memory| memory.content == "Caroline is dating Stefan"));
+    assert!(observation_memories
+        .iter()
+        .any(|memory| memory.content == "Melanie's kids like dinosaurs and nature"));
+    assert!(observation_memories.iter().all(|memory| {
+        memory
+            .metadata
+            .get("extraction_kind")
+            .and_then(|value| value.as_str())
+            == Some("observation")
+    }));
+
+    let second = executor.execute_with_context(&call, &ctx);
+    assert!(second.success, "second add_memories failed: {}", second.content);
+
+    let factual_after = store
+        .get_memories(Some("conv26"), Some(MemoryType::Factual), 20)
+        .unwrap();
+    let observation_after: Vec<_> = factual_after
+        .iter()
+        .filter(|memory| {
+            memory
+                .metadata
+                .get("observation")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+        .collect();
+    assert_eq!(observation_after.len(), 2);
+    assert!(observation_after.iter().all(|memory| {
+        memory
+            .metadata
+            .get("reinforcement_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(1)
+            >= 2
+    }));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

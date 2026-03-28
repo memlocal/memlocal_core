@@ -22,6 +22,13 @@ pub trait LlmProvider: Send + Sync {
     fn complete(&self, system: &str, user: &str) -> Result<String>;
 }
 
+/// Trait for reranking candidate memories after recall.
+/// Implemented by cloud reranker providers such as Jina.
+pub trait RerankerProvider: Send + Sync {
+    /// Returns `(document_index, score)` pairs sorted by descending relevance.
+    fn rerank(&self, query: &str, documents: &[String], top_k: usize) -> Result<Vec<(usize, f64)>>;
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolCall {
     pub id: String,
@@ -44,6 +51,9 @@ pub struct RetrievedMemoryDiagnostic {
     pub memory_type: String,
     pub rank: usize,
     pub score: Option<f64>,
+    pub pre_rerank_rank: Option<usize>,
+    pub pre_rerank_score: Option<f64>,
+    pub rerank_score: Option<f64>,
     pub sources: Vec<String>,
     pub included_in_context: bool,
     pub content: String,
@@ -72,6 +82,7 @@ pub struct PreparedContext {
 pub struct ExecutionContext<'a> {
     pub embedding_provider: &'a dyn EmbeddingProvider,
     pub llm_provider: Option<&'a dyn LlmProvider>,
+    pub reranker_provider: Option<&'a dyn RerankerProvider>,
     pub temporal: Option<&'a TemporalContext>,
 }
 
@@ -81,6 +92,7 @@ impl<'a> ExecutionContext<'a> {
         Self {
             embedding_provider,
             llm_provider: None,
+            reranker_provider: None,
             temporal: None,
         }
     }
@@ -94,9 +106,23 @@ impl<'a> ExecutionContext<'a> {
         Self {
             embedding_provider,
             llm_provider: Some(llm_provider),
+            reranker_provider: None,
             temporal: Some(temporal),
         }
     }
+
+    pub fn with_reranker(mut self, reranker_provider: &'a dyn RerankerProvider) -> Self {
+        self.reranker_provider = Some(reranker_provider);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrievalQueryComplexity {
+    SingleHop,
+    MultiHop,
+    Temporal,
+    OpenEnded,
 }
 
 pub struct ToolExecutor {
@@ -124,13 +150,33 @@ impl ToolExecutor {
         max_results: Option<usize>,
         bm25_only: bool,
     ) -> Result<String> {
+        self.prepare_context_reranked(
+            query,
+            embedding_provider,
+            user_id,
+            max_results,
+            bm25_only,
+            None,
+        )
+    }
+
+    pub fn prepare_context_reranked(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+        bm25_only: bool,
+        reranker: Option<&dyn RerankerProvider>,
+    ) -> Result<String> {
         Ok(self
-            .prepare_context_with_diagnostics(
+            .prepare_context_with_diagnostics_reranked(
                 query,
                 embedding_provider,
                 user_id,
                 max_results,
                 bm25_only,
+                reranker,
             )?
             .context_block)
     }
@@ -142,6 +188,25 @@ impl ToolExecutor {
         user_id: Option<&str>,
         max_results: Option<usize>,
         bm25_only: bool,
+    ) -> Result<PreparedContext> {
+        self.prepare_context_with_diagnostics_reranked(
+            query,
+            embedding_provider,
+            user_id,
+            max_results,
+            bm25_only,
+            None,
+        )
+    }
+
+    pub fn prepare_context_with_diagnostics_reranked(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+        bm25_only: bool,
+        reranker: Option<&dyn RerankerProvider>,
     ) -> Result<PreparedContext> {
         // Query shaping: search the original question plus compact, person-focused,
         // and temporal-aware variants so retrieval does not depend on the exact wording.
@@ -399,29 +464,91 @@ impl ToolExecutor {
 
         apply_query_aware_boosts(&mut all_memories, query);
 
-        // Sort by boosted score, keep top results
+        // Sort by boosted score before optional reranking.
         all_memories.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let limit = max_results.unwrap_or(30);
+
+        let limit = resolve_context_limit(query, max_results);
         let total_unique_retrieved = all_memories.len();
         let truncated_count = total_unique_retrieved.saturating_sub(limit);
+        let pre_rerank_positions: HashMap<String, (usize, Option<f64>)> = all_memories
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.id.clone(), (index + 1, item.score)))
+            .collect();
+
+        let mut rerank_scores_by_id: HashMap<String, f64> = HashMap::new();
+        let rerank_pool_size = resolve_rerank_pool_size(query).min(all_memories.len());
+        if let Some(reranker) = reranker {
+            if rerank_pool_size > 1 && limit > 0 {
+                let rerank_candidates: Vec<MemoryItem> = all_memories
+                    .iter()
+                    .take(rerank_pool_size)
+                    .cloned()
+                    .collect();
+                let documents: Vec<String> = rerank_candidates
+                    .iter()
+                    .map(|item| item.content.clone())
+                    .collect();
+                let rerank_top_k = limit.min(rerank_candidates.len());
+
+                match reranker.rerank(query, &documents, rerank_top_k) {
+                    Ok(reranked) => {
+                        let mut reordered = Vec::with_capacity(all_memories.len());
+                        let mut selected_ids = HashSet::new();
+
+                        for (index, rerank_score) in reranked {
+                            if let Some(mut item) = rerank_candidates.get(index).cloned() {
+                                rerank_scores_by_id.insert(item.id.clone(), rerank_score);
+                                selected_ids.insert(item.id.clone());
+                                item.score = Some(rerank_score);
+                                reordered.push(item);
+                            }
+                        }
+
+                        for item in all_memories {
+                            if selected_ids.contains(&item.id) {
+                                continue;
+                            }
+                            reordered.push(item);
+                        }
+
+                        all_memories = reordered;
+                    }
+                    Err(err) => {
+                        log::warn!("Reranking failed for query {:?}: {}", query, err);
+                    }
+                }
+            }
+        }
+
         let ranked_before_truncation: Vec<RetrievedMemoryDiagnostic> = all_memories
             .iter()
             .enumerate()
-            .map(|(index, item)| RetrievedMemoryDiagnostic {
-                id: item.id.clone(),
-                memory_type: item.memory_type.stored_name().to_string(),
-                rank: index + 1,
-                score: item.score,
-                sources: memory_sources
+            .map(|(index, item)| {
+                let (pre_rerank_rank, pre_rerank_score) = pre_rerank_positions
                     .get(&item.id)
-                    .map(|sources| sources.iter().cloned().collect())
-                    .unwrap_or_default(),
-                included_in_context: index < limit,
-                content: item.content.clone(),
+                    .copied()
+                    .unwrap_or((index + 1, item.score));
+
+                RetrievedMemoryDiagnostic {
+                    id: item.id.clone(),
+                    memory_type: item.memory_type.stored_name().to_string(),
+                    rank: index + 1,
+                    score: item.score,
+                    pre_rerank_rank: Some(pre_rerank_rank),
+                    pre_rerank_score,
+                    rerank_score: rerank_scores_by_id.get(&item.id).copied(),
+                    sources: memory_sources
+                        .get(&item.id)
+                        .map(|sources| sources.iter().cloned().collect())
+                        .unwrap_or_default(),
+                    included_in_context: index < limit,
+                    content: item.content.clone(),
+                }
             })
             .collect();
         all_memories.truncate(limit);
@@ -613,6 +740,7 @@ impl ToolExecutor {
             .as_str()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc));
+        let extra_metadata = args.get("metadata").and_then(|value| value.as_object());
 
         // 1. Exact dedup by content hash
         let hash = MemoryItem::compute_hash(content);
@@ -625,6 +753,19 @@ impl ToolExecutor {
             if let Some(obj) = metadata.as_object_mut() {
                 obj.insert("reinforcement_count".to_string(), serde_json::json!(current_count + 1));
                 obj.insert("last_reinforced_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+                obj.insert("confidence".to_string(), serde_json::json!(confidence));
+                if let Some(extra) = extra_metadata {
+                    for (key, value) in extra {
+                        obj.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            if let Some(speaker) = args.get("speaker").and_then(|v| v.as_str()) {
+                if !speaker.is_empty() {
+                    if let Some(obj) = metadata.as_object_mut() {
+                        obj.insert("speaker".to_string(), serde_json::json!(speaker));
+                    }
+                }
             }
             // Re-embed and update (to persist the metadata change)
             let embedding = ctx.embedding_provider.embed_one(content)?;
@@ -675,6 +816,13 @@ impl ToolExecutor {
                         }
                     }
                 }
+                if let Some(extra) = extra_metadata {
+                    if let Some(obj) = metadata.as_object_mut() {
+                        for (key, value) in extra {
+                            obj.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
                 let updated = MemoryItem {
                     id: existing.id.clone(),
                     content: content.to_string(),
@@ -704,6 +852,13 @@ impl ToolExecutor {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let mut metadata = serde_json::json!({"confidence": confidence});
+        if let Some(extra) = extra_metadata {
+            if let Some(obj) = metadata.as_object_mut() {
+                for (key, value) in extra {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
         if let Some(speaker) = args.get("speaker").and_then(|v| v.as_str()) {
             if !speaker.is_empty() {
                 metadata["speaker"] = serde_json::json!(speaker);
@@ -789,13 +944,17 @@ impl ToolExecutor {
         })?;
 
         // Handle both old format (array) and new format (object) for backwards compat
-        let (extracted, session_summary, speakers_detected) = if response_obj.is_array() {
+        let (extracted, observations, session_summary, speakers_detected) = if response_obj.is_array() {
             // Old format: flat array
             let arr: Vec<serde_json::Value> = serde_json::from_value(response_obj).unwrap_or_default();
-            (arr, None, Vec::new())
+            (arr, Vec::new(), None, Vec::new())
         } else {
             // New format: structured object
             let memories = response_obj.get("memories")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let observations = response_obj.get("observations")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
@@ -806,13 +965,14 @@ impl ToolExecutor {
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            (memories, summary, speakers)
+            (memories, observations, summary, speakers)
         };
 
         let mut stored = Vec::new();
         let mut skipped = 0;
         let mut updated = 0;
         let mut extracted_memory_ids = Vec::new();
+        let mut observation_keys = HashSet::new();
 
         for item in &extracted {
             let content = match item["content"].as_str() {
@@ -952,6 +1112,75 @@ impl ToolExecutor {
             }
         }
 
+        for item in &observations {
+            let raw_content = match item.get("content").and_then(|value| value.as_str()) {
+                Some(content) => content,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let content = raw_content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if content.is_empty() {
+                skipped += 1;
+                continue;
+            }
+
+            let confidence = item.get("confidence").and_then(|value| value.as_f64()).unwrap_or(0.8);
+            if confidence < 0.5 {
+                skipped += 1;
+                continue;
+            }
+
+            let speaker = item.get("speaker").and_then(|value| value.as_str()).unwrap_or("");
+            let observation_key = format!(
+                "{}::{}",
+                speaker.trim().to_lowercase(),
+                content.to_lowercase()
+            );
+            if !observation_keys.insert(observation_key) {
+                skipped += 1;
+                continue;
+            }
+
+            let mut add_args = serde_json::json!({
+                "content": content,
+                "memory_type": "factual",
+                "confidence": confidence,
+                "metadata": {
+                    "observation": true,
+                    "extraction_kind": "observation"
+                }
+            });
+            if let Some(uid) = user_id {
+                add_args["user_id"] = serde_json::Value::String(uid.to_string());
+            }
+            if let Some(session_id) = batch_session_id {
+                add_args["session_id"] = serde_json::Value::String(session_id.to_string());
+            }
+            if let Some(va) = item.get("valid_at") {
+                add_args["valid_at"] = va.clone();
+            }
+            if let Some(ia) = item.get("invalid_at") {
+                add_args["invalid_at"] = ia.clone();
+            }
+            if !speaker.is_empty() {
+                add_args["speaker"] = serde_json::json!(speaker);
+            }
+
+            let result = self.add_memory(&add_args, ctx)?;
+            if let Some(memory_id) = result["memory_id"].as_str() {
+                extracted_memory_ids.push(memory_id.to_string());
+            }
+
+            match result["status"].as_str() {
+                Some("stored") => stored.push(result),
+                Some("updated") => updated += 1,
+                Some("duplicate") | Some("reinforced") => skipped += 1,
+                _ => stored.push(result),
+            }
+        }
+
         // Dual-layer: also store raw text segments as Episodic memories
         let mut raw_stored = 0;
         let mut raw_memory_ids = Vec::new();
@@ -1072,6 +1301,7 @@ impl ToolExecutor {
         Ok(serde_json::json!({
             "status": "extracted",
             "extracted": extracted.len(),
+            "observations_extracted": observations.len(),
             "stored": stored.len(),
             "updated": updated,
             "skipped": skipped,
@@ -1379,8 +1609,25 @@ impl ToolExecutor {
         let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
 
         let context = self.prepare_context(
-            query, ctx.embedding_provider, None, Some(15), false
+            query,
+            ctx.embedding_provider,
+            None,
+            Some(15),
+            false,
         )?;
+
+        let context = if let Some(reranker) = ctx.reranker_provider {
+            self.prepare_context_reranked(
+                query,
+                ctx.embedding_provider,
+                None,
+                Some(15),
+                false,
+                Some(reranker),
+            )?
+        } else {
+            context
+        };
 
         Ok(serde_json::json!({
             "status": "additional_context_retrieved",
@@ -1402,9 +1649,33 @@ impl ToolExecutor {
         user_id: Option<&str>,
         max_results: Option<usize>,
     ) -> Result<PreparedContext> {
+        self.prepare_context_iterative_reranked(
+            query,
+            embedding_provider,
+            llm_provider,
+            user_id,
+            max_results,
+            None,
+        )
+    }
+
+    pub fn prepare_context_iterative_reranked(
+        &self,
+        query: &str,
+        embedding_provider: &dyn EmbeddingProvider,
+        llm_provider: &dyn LlmProvider,
+        user_id: Option<&str>,
+        max_results: Option<usize>,
+        reranker: Option<&dyn RerankerProvider>,
+    ) -> Result<PreparedContext> {
         // Round 1: Standard retrieval
-        let round1 = self.prepare_context_with_diagnostics(
-            query, embedding_provider, user_id, max_results, false
+        let round1 = self.prepare_context_with_diagnostics_reranked(
+            query,
+            embedding_provider,
+            user_id,
+            max_results,
+            false,
+            reranker,
         )?;
 
         // Ask the LLM: is the context sufficient?
@@ -1452,8 +1723,13 @@ impl ToolExecutor {
         let mut additional_memories = Vec::new();
 
         for sq in &sub_queries {
-            let round2 = self.prepare_context_with_diagnostics(
-                sq, embedding_provider, user_id, Some(10), false
+            let round2 = self.prepare_context_with_diagnostics_reranked(
+                sq,
+                embedding_provider,
+                user_id,
+                Some(10),
+                false,
+                reranker,
             )?;
             for mem in round2.diagnostics.ranked_memories {
                 if combined_ids.insert(mem.id.clone()) {
@@ -1483,8 +1759,13 @@ impl ToolExecutor {
         // Rebuild context block using the existing pipeline
         // (Simplest approach: run prepare_context one more time with a combined query)
         let combined_query = format!("{} {}", query, sub_queries.join(" "));
-        let final_context = self.prepare_context_with_diagnostics(
-            &combined_query, embedding_provider, user_id, max_results, false
+        let final_context = self.prepare_context_with_diagnostics_reranked(
+            &combined_query,
+            embedding_provider,
+            user_id,
+            max_results,
+            false,
+            reranker,
         )?;
 
         Ok(PreparedContext {
@@ -1512,6 +1793,54 @@ fn detect_query_speaker(query: &str, known_speakers: &[String]) -> Option<String
         }
     }
     None
+}
+
+fn classify_retrieval_query(query: &str) -> RetrievalQueryComplexity {
+    let lower = query.to_lowercase();
+
+    if lower.starts_with("would ")
+        || lower.starts_with("could ")
+        || lower.starts_with("should ")
+        || lower.contains(" likely ")
+        || lower.contains("consider")
+        || lower.contains("want to")
+    {
+        return RetrievalQueryComplexity::OpenEnded;
+    }
+
+    if is_temporal_query(query) {
+        return RetrievalQueryComplexity::Temporal;
+    }
+
+    if lower.starts_with("when ")
+        || lower.starts_with("how long")
+        || lower.contains(" before ")
+        || lower.contains(" after ")
+        || lower.contains(" during ")
+        || lower.contains(" both ")
+    {
+        return RetrievalQueryComplexity::MultiHop;
+    }
+
+    RetrievalQueryComplexity::SingleHop
+}
+
+fn retrieval_strategy(query: &str) -> (usize, usize) {
+    match classify_retrieval_query(query) {
+        RetrievalQueryComplexity::SingleHop => (80, 8),
+        RetrievalQueryComplexity::MultiHop => (120, 18),
+        RetrievalQueryComplexity::Temporal => (140, 24),
+        RetrievalQueryComplexity::OpenEnded => (100, 15),
+    }
+}
+
+fn resolve_rerank_pool_size(query: &str) -> usize {
+    retrieval_strategy(query).0
+}
+
+fn resolve_context_limit(query: &str, max_results: Option<usize>) -> usize {
+    let default_limit = retrieval_strategy(query).1;
+    max_results.map(|limit| limit.min(default_limit)).unwrap_or(default_limit)
 }
 
 fn build_query_variants(query: &str) -> Vec<String> {

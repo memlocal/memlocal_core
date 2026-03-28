@@ -127,6 +127,7 @@ locations, and intentions.
 OUTPUT FORMAT — structured JSON object (NOT an array):
 {
   "memories": [ ... ],
+    "observations": [ ... ],
   "session_summary": "...",
   "speakers_detected": ["..."]
 }
@@ -145,6 +146,14 @@ Optional temporal fields (include ONLY for time-anchored items):
   For single-day events, set to end-of-day UTC. Omit for persistent facts.
 
 Top-level fields:
+- "observations": array of ultra-literal factual statements that should be preserved exactly as
+    stated, even if they feel too specific or narrow for the main memory list. Use this for facts
+    such as relationship status, exact counts, named books or artists, gifts, reminders, and other
+    precise details that are easy to lose during abstraction. Each observation item MUST have:
+    - "content": a single factual statement using the original wording as closely as possible
+    - "speaker": the person the fact is about or who stated it
+    - "confidence": a number from 0.0 to 1.0
+    Optional temporal fields: "valid_at", "invalid_at"
 - "session_summary": 2-3 sentences summarizing the conversation's narrative arc. Mention speakers
   by name and what they discussed. Include specific dates and key facts mentioned.
 - "speakers_detected": array of ALL speaker names detected in the text. Use actual names.
@@ -229,6 +238,15 @@ RIGHT: "Caroline attended a pride parade" (specific event mentioned)
 WRONG: "They discussed weekend plans" (vague, uses pronoun)
 RIGHT: "Arjun plans to visit Devaraj Market on Saturday" (specific, named, exact)
 
+OBSERVATION EXAMPLES:
+- If the speaker says "I'm dating Stefan", include an observation like "Caroline is dating Stefan"
+- If the speaker says "I bought three beach towels", include an observation like
+    "Caroline bought three beach towels"
+- If the speaker says "The bowl was hand-painted", include an observation like
+    "The bowl was hand-painted"
+- If the speaker says "My kids like dinosaurs and nature", include an observation like
+    "Melanie's kids like dinosaurs and nature"
+
 Rules:
 1. Each memory must be atomic — one fact per item.
 2. Use the speaker's actual name (not "The user") when names are present in the text.
@@ -238,6 +256,7 @@ Rules:
 6. For "remember to..." or future intentions, use prospective type.
 7. Ignore greetings, filler, and meta-conversation.
 8. Every memory MUST have a triple and a speaker — no exceptions.
+9. Observations should stay literal and specific. Do not generalize or paraphrase them.
 
 Only output the JSON object. No explanation, no markdown fencing."#;
 
