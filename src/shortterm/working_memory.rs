@@ -385,10 +385,42 @@ impl WorkingMemory {
 
         buf.trim_end().to_string()
     }
+
+    /// Minimal single-hop context block.
+    ///
+    /// Uses only the top reranked memories and strips section hierarchy,
+    /// scores, and source blocks so the LLM sees a short, flat evidence list.
+    pub fn to_flat_context_block(&self) -> String {
+        let mut buf = String::from("RELEVANT MEMORIES:\n");
+        let mut relevant = self.relevant_memories.clone();
+        sort_by_score_desc(&mut relevant);
+
+        for item in &relevant {
+            let speaker = item.speaker();
+            let speaker_prefix = if speaker.is_empty() {
+                String::new()
+            } else {
+                format!("[{}] ", speaker)
+            };
+            let date_suffix = item
+                .valid_at
+                .map(|dt| format!(" ({})", dt.format("%b %Y")))
+                .unwrap_or_default();
+            let content = item
+                .content
+                .split("\n[Source:")
+                .next()
+                .unwrap_or(&item.content)
+                .trim();
+            buf.push_str(&format!("- {}{}{}\n", speaker_prefix, content, date_suffix));
+        }
+
+        buf.trim_end().to_string()
+    }
 }
 
 fn sort_by_score_desc(items: &mut [MemoryItem]) {
-    items.sort_by(|a, b| compare_scores_desc(a, b));
+    items.sort_by(compare_scores_desc);
 }
 
 fn sort_refs_by_score_desc(items: &mut [&MemoryItem]) {

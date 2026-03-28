@@ -210,6 +210,7 @@ impl ToolExecutor {
     ) -> Result<PreparedContext> {
         // Query shaping: search the original question plus compact, person-focused,
         // and temporal-aware variants so retrieval does not depend on the exact wording.
+        let query_complexity = classify_retrieval_query(query);
         let sub_queries = build_query_variants(query);
         let temporal_focus = is_temporal_query(query);
         let mut all_memories = Vec::new();
@@ -406,6 +407,33 @@ impl ToolExecutor {
             }
         }
 
+        let raw_session_seeds: Vec<(String, String)> = all_memories
+            .iter()
+            .filter(|item| is_raw_conversation_item(item))
+            .filter_map(|item| {
+                item.session_id
+                    .as_ref()
+                    .map(|session_id| (session_id.clone(), item.content.clone()))
+            })
+            .collect();
+        let mut expanded_sessions = HashSet::new();
+        for (session_id, anchor_content) in raw_session_seeds.into_iter().take(5) {
+            if !expanded_sessions.insert(session_id.clone()) {
+                continue;
+            }
+
+            let adjacent = self
+                .store
+                .get_adjacent_turns(&session_id, &anchor_content, 2, user_id)
+                .unwrap_or_default();
+            for item in adjacent {
+                register_item(&item, "session_window");
+                if seen_ids.insert(item.id.clone()) {
+                    all_memories.push(item);
+                }
+            }
+        }
+
         // --- Fix 1: Reserve BM25 slots (guaranteed keyword hits) ---
         // Collect the top BM25-only hits per entity so they can't be displaced by semantic results
         let mut bm25_reserved: Vec<MemoryItem> = Vec::new();
@@ -493,7 +521,7 @@ impl ToolExecutor {
                     .iter()
                     .map(|item| item.content.clone())
                     .collect();
-                let rerank_top_k = limit.min(rerank_candidates.len());
+                let rerank_top_k = rerank_candidates.len();
 
                 match reranker.rerank(query, &documents, rerank_top_k) {
                     Ok(reranked) => {
@@ -556,71 +584,75 @@ impl ToolExecutor {
         // --- Option C: BM25 reserved hits go into a separate priority section ---
         // These are displayed as "KEY FACTS" at the top of the context block
         let keyword_matches = bm25_reserved;
+        let context_block = if matches!(query_complexity, RetrievalQueryComplexity::SingleHop) {
+            let mut wm = crate::shortterm::WorkingMemory::new();
+            wm.set_relevant(all_memories);
+            wm.to_flat_context_block()
+        } else {
+            // Get user profile
+            let profile = match user_id {
+                Some(uid) => self.store.get_profile(uid)?,
+                None => None,
+            };
 
-        // Get user profile
-        let profile = match user_id {
-            Some(uid) => self.store.get_profile(uid)?,
-            None => None,
-        };
+            // Get pending reminders
+            let prospective = self
+                .store
+                .get_pending_prospective(user_id)
+                .unwrap_or_default();
 
-        // Get pending reminders
-        let prospective = self
-            .store
-            .get_pending_prospective(user_id)
-            .unwrap_or_default();
+            // Get important memories
+            let important = self
+                .store
+                .get_important_memories(user_id, 10, 0.5)
+                .unwrap_or_default();
 
-        // Get important memories
-        let important = self
-            .store
-            .get_important_memories(user_id, 10, 0.5)
-            .unwrap_or_default();
-
-        // Collect triples relevant to the query for structured context
-        let mut key_triples = Vec::new();
-        {
-            let query_entities = extract_entities(query);
-            let mut seen_triples = HashSet::new();
-            for entity in &query_entities {
-                let triples = self.store.search_triples(Some(entity), None, None)
+            // Collect triples relevant to the query for structured context
+            let mut key_triples = Vec::new();
+            {
+                let query_entities = extract_entities(query);
+                let mut seen_triples = HashSet::new();
+                for entity in &query_entities {
+                    let triples = self.store.search_triples(Some(entity), None, None)
+                        .unwrap_or_default();
+                    for t in triples {
+                        let key = format!("{}|{}|{}", t.subject, t.predicate, t.object);
+                        if seen_triples.insert(key) {
+                            key_triples.push(t);
+                        }
+                    }
+                }
+                // Also add triples from FTS
+                let fts_triples = self.store.search_triples_fts(query, 15)
                     .unwrap_or_default();
-                for t in triples {
+                for t in fts_triples {
                     let key = format!("{}|{}|{}", t.subject, t.predicate, t.object);
                     if seen_triples.insert(key) {
                         key_triples.push(t);
                     }
                 }
+                key_triples.truncate(20); // Cap to avoid flooding context
             }
-            // Also add triples from FTS
-            let fts_triples = self.store.search_triples_fts(query, 15)
-                .unwrap_or_default();
-            for t in fts_triples {
-                let key = format!("{}|{}|{}", t.subject, t.predicate, t.object);
-                if seen_triples.insert(key) {
-                    key_triples.push(t);
-                }
-            }
-            key_triples.truncate(20); // Cap to avoid flooding context
-        }
 
-        // Collect session summaries for narrative context
-        let context_summaries = if !bm25_only {
-            let q_emb = embedding_provider.embed_one(query)?;
-            self.store.search_summaries(&q_emb, 5).unwrap_or_default()
-        } else {
-            Vec::new()
+            // Collect session summaries for narrative context
+            let context_summaries = if !bm25_only {
+                let q_emb = embedding_provider.embed_one(query)?;
+                self.store.search_summaries(&q_emb, 5).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            // Assemble using WorkingMemory
+            let mut wm = crate::shortterm::WorkingMemory::new();
+            wm.set_keyword_matches(keyword_matches);
+            wm.set_key_triples(key_triples);
+            wm.set_session_summaries(context_summaries);
+            wm.set_relevant(all_memories);
+            wm.set_important(important);
+            wm.set_profile(profile);
+            wm.set_triggered_reminders(prospective);
+            wm.to_context_block()
         };
-
-        // Assemble using WorkingMemory
-        let mut wm = crate::shortterm::WorkingMemory::new();
-        wm.set_keyword_matches(keyword_matches);
-        wm.set_key_triples(key_triples);
-        wm.set_session_summaries(context_summaries);
-        wm.set_relevant(all_memories);
-        wm.set_important(important);
-        wm.set_profile(profile);
-        wm.set_triggered_reminders(prospective);
-
-        let context_block = wm.to_context_block();
         let mut source_counts = BTreeMap::new();
         for sources in memory_sources.values() {
             for source in sources {
@@ -1827,7 +1859,7 @@ fn classify_retrieval_query(query: &str) -> RetrievalQueryComplexity {
 
 fn retrieval_strategy(query: &str) -> (usize, usize) {
     match classify_retrieval_query(query) {
-        RetrievalQueryComplexity::SingleHop => (80, 8),
+        RetrievalQueryComplexity::SingleHop => (80, 15),
         RetrievalQueryComplexity::MultiHop => (120, 18),
         RetrievalQueryComplexity::Temporal => (140, 24),
         RetrievalQueryComplexity::OpenEnded => (100, 15),

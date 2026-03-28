@@ -306,6 +306,58 @@ impl MemoryStore {
         rows_to_items(&result)
     }
 
+    /// Fetch raw conversation turns adjacent to an anchor turn within the same session.
+    pub fn get_adjacent_turns(
+        &self,
+        session_id: &str,
+        anchor_content: &str,
+        window: usize,
+        user_id: Option<&str>,
+    ) -> Result<Vec<MemoryItem>> {
+        if window == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut session_items = self.get_memories_by_session(session_id, user_id, 200)?;
+        session_items.retain(|item| {
+            item.metadata
+                .get("source")
+                .and_then(|value| value.as_str())
+                .map(|value| value == "raw_conversation")
+                .unwrap_or(false)
+        });
+
+        session_items.sort_by(|a, b| {
+            a.valid_at
+                .cmp(&b.valid_at)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.updated_at.cmp(&b.updated_at))
+        });
+
+        let Some(anchor_index) = session_items.iter().position(|item| {
+            item.content == anchor_content
+                || item.content.contains(anchor_content)
+                || anchor_content.contains(&item.content)
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let start = anchor_index.saturating_sub(window);
+        let end = (anchor_index + window + 1).min(session_items.len());
+
+        Ok(session_items[start..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, item)| {
+                if start + offset == anchor_index {
+                    None
+                } else {
+                    Some(item.clone())
+                }
+            })
+            .collect())
+    }
+
     /// Invalidate (soft-delete) a memory using RETRACT validity.
     /// The memory's history is preserved — it just becomes invisible at "NOW".
     pub fn invalidate_memory(&self, id: &str) -> Result<()> {

@@ -254,6 +254,41 @@ fn test_memory_count() {
 }
 
 #[test]
+fn test_get_adjacent_turns_returns_neighboring_raw_segments() {
+    let store = open_store();
+
+    for index in 0..4 {
+        let timestamp = Utc::now() + chrono::Duration::seconds(index as i64);
+        let item = MemoryItem {
+            id: Uuid::new_v4().to_string(),
+            content: format!("[Session 1] Turn {}", index + 1),
+            memory_type: MemoryType::Episodic,
+            hash: MemoryItem::compute_hash(&format!("turn-{}", index + 1)),
+            user_id: Some("alice".to_string()),
+            agent_id: None,
+            session_id: Some("session-1".to_string()),
+            metadata: serde_json::json!({"source": "raw_conversation"}),
+            created_at: timestamp,
+            updated_at: timestamp,
+            valid_at: Some(timestamp),
+            invalid_at: None,
+            score: None,
+        };
+        store
+            .put_memory(&item, &mock_embedding(300 + index as u32))
+            .unwrap();
+    }
+
+    let adjacent = store
+        .get_adjacent_turns("session-1", "[Session 1] Turn 2", 1, Some("alice"))
+        .unwrap();
+
+    assert_eq!(adjacent.len(), 2);
+    assert!(adjacent.iter().any(|item| item.content == "[Session 1] Turn 1"));
+    assert!(adjacent.iter().any(|item| item.content == "[Session 1] Turn 3"));
+}
+
+#[test]
 fn test_put_and_get_edges() {
     let store = open_store();
 
@@ -513,6 +548,45 @@ fn test_prepare_context_reranked_updates_diagnostics() {
     let top = &prepared.diagnostics.ranked_memories[0];
     assert!(top.pre_rerank_rank.unwrap_or(1) > 1);
     assert!(top.rerank_score.is_some());
+    assert!(prepared
+        .diagnostics
+        .ranked_memories
+        .iter()
+        .take(3)
+        .all(|memory| memory.rerank_score.is_some()));
+}
+
+#[test]
+fn test_prepare_context_single_hop_uses_flat_context() {
+    let store = open_store();
+    let embed = MockEmbedding;
+    let executor = ToolExecutor::new(Arc::clone(&store));
+
+    for content in [
+        "Melanie saw Summer Sounds at her daughter's birthday concert",
+        "Matt Patterson performed at Melanie's daughter's birthday concert",
+        "Melanie likes pottery classes on weekends",
+    ] {
+        let item = make_item(content, Some("melanie"), MemoryType::Factual);
+        let emb = embed.embed_one(content).unwrap();
+        store.put_memory(&item, &emb).unwrap();
+    }
+
+    let prepared = executor
+        .prepare_context_with_diagnostics_reranked(
+            "What musical artists has Melanie seen?",
+            &embed,
+            Some("melanie"),
+            Some(5),
+            false,
+            Some(&ReverseReranker),
+        )
+        .unwrap();
+
+    assert!(prepared.context_block.starts_with("RELEVANT MEMORIES:\n"));
+    assert!(!prepared.context_block.contains("=== KEY FACTS"));
+    assert!(!prepared.context_block.contains("=== TOP EVIDENCE"));
+    assert!(!prepared.context_block.contains("relevance:"));
 }
 
 #[test]
