@@ -1,0 +1,55 @@
+name: Benchmark regression
+description: Report a measurable regression in retrieval quality, latency, or benchmark scores.
+title: "[Benchmark]: "
+labels:
+  - benchmark
+  - triage
+body:
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Benchmark or evaluation target
+      description: Which benchmark or scenario regressed?
+      placeholder: LoCoMo conv-30, integration test, local latency run, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline result
+      description: What result did you expect based on prior runs?
+      placeholder: pass rate, score, latency, memory usage, or ranking quality
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current result
+      description: What result are you seeing now?
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Reproduction command
+      description: Include the command, flags, and relevant config.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and revision
+      description: Commit, OS, Rust version, model/provider setup, and feature flags.
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Suspected cause, diffs, logs, charts, or result files.

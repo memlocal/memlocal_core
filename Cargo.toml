@@ -2,7 +2,7 @@
 name = "memlocal_core"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 description = "Core memory engine for memlocal — local-first AI memory layer with CozoDB"
 keywords = ["ai", "memory", "graph", "vector-search", "embedded-database"]
 categories = ["database", "science"]
