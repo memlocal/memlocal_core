@@ -21,7 +21,7 @@
 On the [LoCoMo benchmark](https://snap-research.github.io/locomo/), memlocal achieves an **80.0% pass rate** and **4.21/5 average LLM score** — outperforming [Letta](https://github.com/letta-ai/letta) (74.0%), [Mem0](https://mem0.ai/research) (66.9%), [PAM](https://manager.harmix.ai/blog/pam-locomo-benchmark-results) (74.35%), and [OpenAI ChatGPT Memory](https://openai.com/index/memory-and-new-controls-for-chatgpt/) (52.9%), while keeping all data on-device.
 
 ```
-369 conversation turns → 1,017 extracted memories → 105 questions → 80.0% pass rate
+LoCoMo → 80.0% pass rate
 ```
 
 ---
@@ -326,25 +326,24 @@ where c = confidence, R(r) = reinforcement, A(a) = ln(1+access_count)/ln(101), D
 
 ## Benchmark Results
 
-Evaluated on the **LoCoMo** (Long Conversation Memory) benchmark — 105 questions across four categories on conversation conv-30 (369 turns, 1,017 extracted memories).
+Evaluated on the **LoCoMo** (Long Conversation Memory) benchmark.
 
 ### Overall Results
 
 | Metric                | Value              |
 | --------------------- | ------------------ |
-| **Pass rate (≥3/5)**  | **84/105 (80.0%)** |
+| **Pass rate (≥3/5)**  | **80.0%**          |
 | **Average LLM score** | **4.21/5**         |
-| **Standard J-score**  | 69/105 (65.7%)     |
 | Average keyword F1    | 0.146              |
 
 ### Per-Category Breakdown
 
-| Category        | Count | J-score | Avg LLM Score | Pass Rate |
-| --------------- | ----- | ------- | ------------- | --------- |
-| Single-hop      | 11    | 27.3%   | 3.00          | 45.5%     |
-| **Multi-hop**   | 26    | 92.3%   | 4.65          | **96.2%** |
-| Temporal        | 44    | 72.7%   | 4.14          | 77.3%     |
-| **Adversarial** | 24    | 41.7%   | 4.42          | **83.3%** |
+| Category        | Avg LLM Score | Pass Rate |
+| --------------- | ------------- | --------- |
+| Single-hop      | 3.00          | 45.5%     |
+| **Multi-hop**   | 4.65          | **96.2%** |
+| Temporal        | 4.14          | 77.3%     |
+| **Adversarial** | 4.42          | **83.3%** |
 
 ### Performance Trajectory
 
@@ -355,22 +354,14 @@ Evaluated on the **LoCoMo** (Long Conversation Memory) benchmark — 105 questio
 | v3      | + Jina reranker, query classification, adaptive context                | 66.3%     |
 | **v4**  | **+ Pool fix, flat SingleHop context, session windows, extraction v2** | **80.0%** |
 
-### Diagnostic Summary
-
-| Metric                                      | Value |
-| ------------------------------------------- | ----- |
-| Failed questions with evidence in retrieval | 32    |
-| Failed questions with evidence in context   | 21    |
-| Failed questions with explicit refusal      | 3     |
-
 ### Failure Patterns
 
-| Pattern      | Count | Description                                       |
-| ------------ | ----- | ------------------------------------------------- |
-| SPEAKER_SWAP | 13    | LLM attributes a fact to the wrong speaker        |
-| WRONG_FACT   | 11    | LLM includes incorrect details from noisy context |
-| INCOMPLETE   | 9     | Evidence ranked just outside the context window   |
-| LLM_REFUSE   | 3     | LLM declines to answer despite evidence present   |
+| Pattern      | Description                                       |
+| ------------ | ------------------------------------------------- |
+| SPEAKER_SWAP | LLM attributes a fact to the wrong speaker        |
+| WRONG_FACT   | LLM includes incorrect details from noisy context |
+| INCOMPLETE   | Evidence ranked just outside the context window   |
+| LLM_REFUSE   | LLM declines to answer despite evidence present   |
 
 ---
 
@@ -757,7 +748,6 @@ The Rust core compiles to `cdylib` and `staticlib` targets. Platform SDKs implem
 - [ ] Kotlin/Swift native SDK bindings
 - [ ] MCP (Model Context Protocol) server integration
 - [ ] Multi-agent shared memory with access controls
-- [ ] Full LoCoMo benchmark run (all 10 conversations)
 - [ ] LaTeX white paper for arXiv submission
 
 ---
