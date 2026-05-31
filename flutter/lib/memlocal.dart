@@ -6,3 +6,5 @@ export 'src/providers/embedding_provider.dart';
 export 'src/providers/openai_embedding_provider.dart';
 export 'src/providers/llm_provider.dart';
 export 'src/providers/openai_llm_provider.dart';
+export 'src/providers/reranker_provider.dart';
+export 'src/providers/jina_reranker.dart';
