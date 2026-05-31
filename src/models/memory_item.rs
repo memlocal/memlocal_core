@@ -1,6 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::memory_type::MemoryType;
 use crate::error::{MemlocalError, Result};
@@ -27,6 +28,27 @@ pub struct MemoryItem {
 }
 
 impl MemoryItem {
+    /// Create a new memory item with a generated id, content hash, and current timestamps.
+    pub fn new(content: impl Into<String>, memory_type: MemoryType) -> Self {
+        let content = content.into();
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            hash: Self::compute_hash(&content),
+            content,
+            memory_type,
+            user_id: None,
+            agent_id: None,
+            session_id: None,
+            metadata: serde_json::Value::Object(Default::default()),
+            created_at: now,
+            updated_at: now,
+            valid_at: None,
+            invalid_at: None,
+            score: None,
+        }
+    }
+
     /// Compute a SHA-256 hash of the content for deduplication.
     pub fn compute_hash(content: &str) -> String {
         let mut hasher = Sha256::new();
