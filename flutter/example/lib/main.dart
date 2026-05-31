@@ -26,7 +26,10 @@ class _SmokeAppState extends State<SmokeApp> {
     try {
       final mem = await Memlocal.openInMemory(dimensions: 1536);
       final count = await mem.memoryCount();
-      setState(() => _status = 'OK — engine open, memoryCount=$count');
+      final doubled =
+          await callDartClosure(value: 21, callback: (v) async => v * 2);
+      setState(() => _status =
+          'OK — engine open, memoryCount=$count, callback(21)=$doubled');
     } catch (e) {
       setState(() => _status = 'FAILED: $e');
     }

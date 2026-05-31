@@ -6,6 +6,16 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+/// Calls a Dart-provided async closure and returns its result.
+/// Proves FRB can invoke Dart back from Rust (foundation for Dart-side providers).
+Future<int> callDartClosure({
+  required int value,
+  required FutureOr<int> Function(int) callback,
+}) => RustLib.instance.api.crateApiSkeletonCallDartClosure(
+  value: value,
+  callback: callback,
+);
+
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Memlocal>>
 abstract class Memlocal implements RustOpaqueInterface {
   /// Total stored memories (None = all types).

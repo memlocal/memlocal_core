@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use flutter_rust_bridge::DartFnFuture;
 use memlocal_core::api::MemlocalEngine;
 use memlocal_core::models::{CoreConfig, StorageConfig};
 
@@ -30,6 +31,15 @@ impl Memlocal {
             .map(|c| c as u32)
             .map_err(|e| e.to_string())
     }
+}
+
+/// Calls a Dart-provided async closure and returns its result.
+/// Proves FRB can invoke Dart back from Rust (foundation for Dart-side providers).
+pub async fn call_dart_closure(
+    value: i32,
+    callback: impl Fn(i32) -> DartFnFuture<i32>,
+) -> i32 {
+    callback(value).await
 }
 
 #[cfg(test)]
