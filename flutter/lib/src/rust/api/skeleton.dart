@@ -18,12 +18,66 @@ Future<int> callDartClosure({
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Memlocal>>
 abstract class Memlocal implements RustOpaqueInterface {
+  /// Store `content` as a Factual memory using a caller-supplied embedding. Returns the new id.
+  Future<String> addMemory({
+    required String content,
+    required List<double> embedding,
+  });
+
   /// Total stored memories (None = all types).
   Future<int> memoryCount();
+
+  /// Open a persistent engine backed by a SQLite file at `db_path`.
+  static Future<Memlocal> open({
+    required String dbPath,
+    required int dimensions,
+  }) => RustLib.instance.api.crateApiSkeletonMemlocalOpen(
+    dbPath: dbPath,
+    dimensions: dimensions,
+  );
 
   /// Open an in-memory engine. Phase 0 smoke entry point.
   static Future<Memlocal> openInMemory({required int dimensions}) => RustLib
       .instance
       .api
       .crateApiSkeletonMemlocalOpenInMemory(dimensions: dimensions);
+
+  /// Semantic (HNSW) search using a caller-supplied query embedding. Returns the top-k recalled memories.
+  Future<List<RecalledMemory>> searchSemantic({
+    required List<double> embedding,
+    required int k,
+  });
+}
+
+/// A memory returned from a search, flattened for the FFI boundary.
+class RecalledMemory {
+  final String id;
+  final String content;
+
+  /// The stored memory-type name (e.g. "factual").
+  final String kind;
+
+  /// Relevance score from the search, if available.
+  final double? score;
+
+  const RecalledMemory({
+    required this.id,
+    required this.content,
+    required this.kind,
+    this.score,
+  });
+
+  @override
+  int get hashCode =>
+      id.hashCode ^ content.hashCode ^ kind.hashCode ^ score.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RecalledMemory &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          content == other.content &&
+          kind == other.kind &&
+          score == other.score;
 }

@@ -64,7 +64,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.11.1';
 
   @override
-  int get rustContentHash => 386902001;
+  int get rustContentHash => -997790936;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -75,10 +75,27 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 }
 
 abstract class RustLibApi extends BaseApi {
+  Future<String> crateApiSkeletonMemlocalAddMemory({
+    required Memlocal that,
+    required String content,
+    required List<double> embedding,
+  });
+
   Future<int> crateApiSkeletonMemlocalMemoryCount({required Memlocal that});
+
+  Future<Memlocal> crateApiSkeletonMemlocalOpen({
+    required String dbPath,
+    required int dimensions,
+  });
 
   Future<Memlocal> crateApiSkeletonMemlocalOpenInMemory({
     required int dimensions,
+  });
+
+  Future<List<RecalledMemory>> crateApiSkeletonMemlocalSearchSemantic({
+    required Memlocal that,
+    required List<double> embedding,
+    required int k,
   });
 
   Future<int> crateApiSkeletonCallDartClosure({
@@ -104,6 +121,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   });
 
   @override
+  Future<String> crateApiSkeletonMemlocalAddMemory({
+    required Memlocal that,
+    required String content,
+    required List<double> embedding,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMemlocal(
+            that,
+            serializer,
+          );
+          sse_encode_String(content, serializer);
+          sse_encode_list_prim_f_32_loose(embedding, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 1,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSkeletonMemlocalAddMemoryConstMeta,
+        argValues: [that, content, embedding],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSkeletonMemlocalAddMemoryConstMeta =>
+      const TaskConstMeta(
+        debugName: "Memlocal_add_memory",
+        argNames: ["that", "content", "embedding"],
+      );
+
+  @override
   Future<int> crateApiSkeletonMemlocalMemoryCount({required Memlocal that}) {
     return handler.executeNormal(
       NormalTask(
@@ -116,7 +173,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 1,
+            funcId: 2,
             port: port_,
           );
         },
@@ -138,6 +195,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<Memlocal> crateApiSkeletonMemlocalOpen({
+    required String dbPath,
+    required int dimensions,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(dbPath, serializer);
+          sse_encode_u_32(dimensions, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData:
+              sse_decode_Auto_Owned_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMemlocal,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSkeletonMemlocalOpenConstMeta,
+        argValues: [dbPath, dimensions],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSkeletonMemlocalOpenConstMeta =>
+      const TaskConstMeta(
+        debugName: "Memlocal_open",
+        argNames: ["dbPath", "dimensions"],
+      );
+
+  @override
   Future<Memlocal> crateApiSkeletonMemlocalOpenInMemory({
     required int dimensions,
   }) {
@@ -149,7 +242,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 2,
+            funcId: 4,
             port: port_,
           );
         },
@@ -172,6 +265,46 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       );
 
   @override
+  Future<List<RecalledMemory>> crateApiSkeletonMemlocalSearchSemantic({
+    required Memlocal that,
+    required List<double> embedding,
+    required int k,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_Auto_Ref_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerMemlocal(
+            that,
+            serializer,
+          );
+          sse_encode_list_prim_f_32_loose(embedding, serializer);
+          sse_encode_u_32(k, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 5,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_recalled_memory,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiSkeletonMemlocalSearchSemanticConstMeta,
+        argValues: [that, embedding, k],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSkeletonMemlocalSearchSemanticConstMeta =>
+      const TaskConstMeta(
+        debugName: "Memlocal_search_semantic",
+        argNames: ["that", "embedding", "k"],
+      );
+
+  @override
   Future<int> crateApiSkeletonCallDartClosure({
     required int value,
     required FutureOr<int> Function(int) callback,
@@ -188,7 +321,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 3,
+            funcId: 6,
             port: port_,
           );
         },
@@ -305,6 +438,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  double dco_decode_box_autoadd_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
+  double dco_decode_f_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
+  double dco_decode_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as double;
+  }
+
+  @protected
   int dco_decode_i_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -317,9 +468,47 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<double> dco_decode_list_prim_f_32_loose(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as List<double>;
+  }
+
+  @protected
+  Float32List dco_decode_list_prim_f_32_strict(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as Float32List;
+  }
+
+  @protected
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  List<RecalledMemory> dco_decode_list_recalled_memory(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_recalled_memory).toList();
+  }
+
+  @protected
+  double? dco_decode_opt_box_autoadd_f_64(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_f_64(raw);
+  }
+
+  @protected
+  RecalledMemory dco_decode_recalled_memory(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return RecalledMemory(
+      id: dco_decode_String(arr[0]),
+      content: dco_decode_String(arr[1]),
+      kind: dco_decode_String(arr[2]),
+      score: dco_decode_opt_box_autoadd_f_64(arr[3]),
+    );
   }
 
   @protected
@@ -404,6 +593,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  double sse_decode_box_autoadd_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_f_64(deserializer));
+  }
+
+  @protected
+  double sse_decode_f_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat32();
+  }
+
+  @protected
+  double sse_decode_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getFloat64();
+  }
+
+  @protected
   int sse_decode_i_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getInt32();
@@ -416,10 +623,64 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<double> sse_decode_list_prim_f_32_loose(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var len_ = sse_decode_i_32(deserializer);
+    return deserializer.buffer.getFloat32List(len_);
+  }
+
+  @protected
+  Float32List sse_decode_list_prim_f_32_strict(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var len_ = sse_decode_i_32(deserializer);
+    return deserializer.buffer.getFloat32List(len_);
+  }
+
+  @protected
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  List<RecalledMemory> sse_decode_list_recalled_memory(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <RecalledMemory>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_recalled_memory(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  double? sse_decode_opt_box_autoadd_f_64(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_f_64(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  RecalledMemory sse_decode_recalled_memory(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_String(deserializer);
+    var var_content = sse_decode_String(deserializer);
+    var var_kind = sse_decode_String(deserializer);
+    var var_score = sse_decode_opt_box_autoadd_f_64(deserializer);
+    return RecalledMemory(
+      id: var_id,
+      content: var_content,
+      kind: var_kind,
+      score: var_score,
+    );
   }
 
   @protected
@@ -533,6 +794,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_f_64(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_f_64(self, serializer);
+  }
+
+  @protected
+  void sse_encode_f_32(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat32(self);
+  }
+
+  @protected
+  void sse_encode_f_64(double self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putFloat64(self);
+  }
+
+  @protected
   void sse_encode_i_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putInt32(self);
@@ -545,6 +824,28 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_list_prim_f_32_loose(
+    List<double> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    serializer.buffer.putFloat32List(
+      self is Float32List ? self : Float32List.fromList(self),
+    );
+  }
+
+  @protected
+  void sse_encode_list_prim_f_32_strict(
+    Float32List self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    serializer.buffer.putFloat32List(self);
+  }
+
+  @protected
   void sse_encode_list_prim_u_8_strict(
     Uint8List self,
     SseSerializer serializer,
@@ -552,6 +853,40 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_list_recalled_memory(
+    List<RecalledMemory> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_recalled_memory(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_f_64(double? self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_f_64(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_recalled_memory(
+    RecalledMemory self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.id, serializer);
+    sse_encode_String(self.content, serializer);
+    sse_encode_String(self.kind, serializer);
+    sse_encode_opt_box_autoadd_f_64(self.score, serializer);
   }
 
   @protected
@@ -603,7 +938,27 @@ class MemlocalImpl extends RustOpaque implements Memlocal {
         RustLib.instance.api.rust_arc_decrement_strong_count_MemlocalPtr,
   );
 
+  /// Store `content` as a Factual memory using a caller-supplied embedding. Returns the new id.
+  Future<String> addMemory({
+    required String content,
+    required List<double> embedding,
+  }) => RustLib.instance.api.crateApiSkeletonMemlocalAddMemory(
+    that: this,
+    content: content,
+    embedding: embedding,
+  );
+
   /// Total stored memories (None = all types).
   Future<int> memoryCount() =>
       RustLib.instance.api.crateApiSkeletonMemlocalMemoryCount(that: this);
+
+  /// Semantic (HNSW) search using a caller-supplied query embedding. Returns the top-k recalled memories.
+  Future<List<RecalledMemory>> searchSemantic({
+    required List<double> embedding,
+    required int k,
+  }) => RustLib.instance.api.crateApiSkeletonMemlocalSearchSemantic(
+    that: this,
+    embedding: embedding,
+    k: k,
+  );
 }
