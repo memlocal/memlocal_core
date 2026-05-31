@@ -2,37 +2,41 @@ import 'package:flutter/material.dart';
 import 'package:memlocal/memlocal.dart';
 
 Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
-  runApp(const MyApp());
+  runApp(const SmokeApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class SmokeApp extends StatefulWidget {
+  const SmokeApp({super.key});
+  @override
+  State<SmokeApp> createState() => _SmokeAppState();
+}
+
+class _SmokeAppState extends State<SmokeApp> {
+  String _status = 'opening engine…';
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      home: Scaffold(
-        appBar: AppBar(title: const Text('memlocal quickstart')),
-        body: Center(
-          child: FutureBuilder<int>(
-            future: Memlocal.openInMemory(dimensions: 1536)
-                .then((m) => m.memoryCount()),
-            builder: (context, snapshot) {
-              if (snapshot.hasError) {
-                return Text('Error: ${snapshot.error}');
-              }
-              if (!snapshot.hasData) {
-                return const CircularProgressIndicator();
-              }
-              return Text(
-                'Action: open in-memory engine + count\n'
-                'Result: `${snapshot.data}`',
-              );
-            },
-          ),
-        ),
-      ),
-    );
+  void initState() {
+    super.initState();
+    _run();
   }
+
+  Future<void> _run() async {
+    try {
+      final mem = await Memlocal.openInMemory(dimensions: 1536);
+      final count = await mem.memoryCount();
+      setState(() => _status = 'OK — engine open, memoryCount=$count');
+    } catch (e) {
+      setState(() => _status = 'FAILED: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        home: Scaffold(
+          appBar: AppBar(title: const Text('memlocal smoke test')),
+          body: Center(child: Text(_status, key: const Key('status'))),
+        ),
+      );
 }
