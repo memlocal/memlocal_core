@@ -4,6 +4,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _apiKeyPref = 'openai_api_key';
+const _jinaKeyPref = 'jina_api_key';
 const _dimensions = 1536;
 
 Future<void> main() async {
@@ -27,26 +28,47 @@ class MemoryChatApp extends StatelessWidget {
 }
 
 /// The kind of item rendered in the transcript.
-enum ChatRole { user, recalled, assistant, error }
+enum ChatRole { user, recalled, assistant, system, error }
 
 /// One renderable entry in the chat transcript.
 class ChatItem {
   ChatItem.user(this.text)
       : role = ChatRole.user,
-        recalled = const [];
+        recalled = const [],
+        scores = const [],
+        rerankedByJina = false;
   ChatItem.assistant(this.text)
       : role = ChatRole.assistant,
-        recalled = const [];
+        recalled = const [],
+        scores = const [],
+        rerankedByJina = false;
+  ChatItem.system(this.text)
+      : role = ChatRole.system,
+        recalled = const [],
+        scores = const [],
+        rerankedByJina = false;
   ChatItem.error(this.text)
       : role = ChatRole.error,
-        recalled = const [];
-  ChatItem.recalled(this.recalled)
-      : role = ChatRole.recalled,
+        recalled = const [],
+        scores = const [],
+        rerankedByJina = false;
+  ChatItem.recalled(
+    this.recalled, {
+    required this.scores,
+    required this.rerankedByJina,
+  })  : role = ChatRole.recalled,
         text = '';
 
   final ChatRole role;
   final String text;
   final List<RecalledMemory> recalled;
+
+  /// The score to display per recalled memory (parallel to [recalled]): the
+  /// Jina relevance score when [rerankedByJina], otherwise the semantic score.
+  final List<double?> scores;
+
+  /// Whether [recalled] was reordered by the Jina reranker (vs. semantic order).
+  final bool rerankedByJina;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -63,8 +85,10 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Memlocal? _engine;
   String? _apiKey;
+  String? _jinaKey;
   EmbeddingProvider? _embeddingProvider;
   LlmProvider? _llmProvider;
+  RerankerProvider? _reranker;
 
   bool _initializing = true;
   bool _sending = false;
@@ -95,11 +119,13 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       final prefs = await SharedPreferences.getInstance();
       final key = prefs.getString(_apiKeyPref);
+      final jinaKey = prefs.getString(_jinaKeyPref);
       if (!mounted) return;
       setState(() {
         _engine = engine;
         _initializing = false;
         _applyKey(key);
+        _applyJinaKey(jinaKey);
       });
     } catch (e) {
       if (!mounted) return;
@@ -124,21 +150,51 @@ class _ChatScreenState extends State<ChatScreen> {
     _llmProvider = OpenAILlmProvider(trimmed);
   }
 
+  /// Builds (or clears) the optional Jina reranker from a key. Call inside
+  /// setState. When absent, [_reranker] stays null and the chat falls back to
+  /// plain semantic top-5.
+  void _applyJinaKey(String? key) {
+    final trimmed = key?.trim();
+    if (trimmed == null || trimmed.isEmpty) {
+      _jinaKey = null;
+      _reranker = null;
+      return;
+    }
+    _jinaKey = trimmed;
+    _reranker = JinaReranker(trimmed);
+  }
+
   Future<void> _openSettings() async {
-    final controller = TextEditingController(text: _apiKey ?? '');
-    final saved = await showDialog<String?>(
+    final openAiController = TextEditingController(text: _apiKey ?? '');
+    final jinaController = TextEditingController(text: _jinaKey ?? '');
+    final saved = await showDialog<({String openAi, String jina})>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('OpenAI API key'),
-        content: TextField(
-          controller: controller,
-          obscureText: true,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: 'sk-...',
-            hintText: 'Paste your OpenAI API key',
-            border: OutlineInputBorder(),
-          ),
+        title: const Text('Settings'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: openAiController,
+              obscureText: true,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'OpenAI API key',
+                hintText: 'sk-...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: jinaController,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Jina API key (optional — enables reranking)',
+                hintText: 'jina_...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
         ),
         actions: [
           TextButton(
@@ -146,24 +202,37 @@ class _ChatScreenState extends State<ChatScreen> {
             child: const Text('Cancel'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx, controller.text),
+            onPressed: () => Navigator.pop(
+              ctx,
+              (openAi: openAiController.text, jina: jinaController.text),
+            ),
             child: const Text('Save'),
           ),
         ],
       ),
     );
-    controller.dispose();
+    openAiController.dispose();
+    jinaController.dispose();
     if (saved == null) return; // dialog cancelled
 
     final prefs = await SharedPreferences.getInstance();
-    final trimmed = saved.trim();
-    if (trimmed.isEmpty) {
+    final openAi = saved.openAi.trim();
+    if (openAi.isEmpty) {
       await prefs.remove(_apiKeyPref);
     } else {
-      await prefs.setString(_apiKeyPref, trimmed);
+      await prefs.setString(_apiKeyPref, openAi);
+    }
+    final jina = saved.jina.trim();
+    if (jina.isEmpty) {
+      await prefs.remove(_jinaKeyPref);
+    } else {
+      await prefs.setString(_jinaKeyPref, jina);
     }
     if (!mounted) return;
-    setState(() => _applyKey(trimmed));
+    setState(() {
+      _applyKey(openAi);
+      _applyJinaKey(jina);
+    });
   }
 
   void _scrollToBottom() {
@@ -184,6 +253,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final engine = _engine!;
     final embeddingProvider = _embeddingProvider!;
     final llmProvider = _llmProvider!;
+    final reranker = _reranker;
 
     setState(() {
       _items.add(ChatItem.user(text));
@@ -195,8 +265,39 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       // b. Embed the new message.
       final embedding = await embeddingProvider.embedOne(text);
-      // c. Recall PRIOR memories (search BEFORE storing the current message).
-      final recalled = await engine.searchSemantic(embedding: embedding, k: 5);
+      // c. Recall PRIOR memories: pull a larger candidate pool BEFORE storing
+      //    the current message, then optionally rerank it down to the top 5.
+      final pool = await engine.searchSemantic(embedding: embedding, k: 20);
+
+      List<RecalledMemory> recalled;
+      List<double?> scores;
+      bool rerankedByJina;
+      String? rerankNote;
+
+      if (reranker != null && pool.isNotEmpty) {
+        try {
+          final ranked = await reranker.rerank(
+            text,
+            pool.map((m) => m.content).toList(),
+            topN: 5,
+          );
+          recalled = ranked.map((r) => pool[r.index]).toList();
+          scores = ranked.map<double?>((r) => r.score).toList();
+          rerankedByJina = true;
+        } catch (e) {
+          // Reranking is best-effort: fall back to semantic order, note it,
+          // but never abort the turn.
+          recalled = pool.take(5).toList();
+          scores = recalled.map((m) => m.score).toList();
+          rerankedByJina = false;
+          rerankNote = '(rerank failed: $e, using semantic order)';
+        }
+      } else {
+        recalled = pool.take(5).toList();
+        scores = recalled.map((m) => m.score).toList();
+        rerankedByJina = false;
+      }
+
       // d. Store the current message for future turns.
       await engine.addMemory(content: text, embedding: embedding);
       // e. Build the memory-grounded system prompt + single LLM call.
@@ -210,7 +311,12 @@ class _ChatScreenState extends State<ChatScreen> {
       // f. Show recalled context, then the assistant reply.
       if (!mounted) return;
       setState(() {
-        _items.add(ChatItem.recalled(recalled));
+        _items.add(ChatItem.recalled(
+          recalled,
+          scores: scores,
+          rerankedByJina: rerankedByJina,
+        ));
+        if (rerankNote != null) _items.add(ChatItem.system(rerankNote));
         _items.add(ChatItem.assistant(reply));
         _sending = false;
       });
@@ -233,7 +339,7 @@ class _ChatScreenState extends State<ChatScreen> {
         title: const Text('memlocal chat'),
         actions: [
           IconButton(
-            tooltip: 'OpenAI API key',
+            tooltip: 'Settings',
             icon: const Icon(Icons.settings),
             onPressed: _initializing ? null : _openSettings,
           ),
@@ -386,6 +492,19 @@ class _ChatItemView extends StatelessWidget {
           color: Theme.of(context).colorScheme.surfaceContainerHighest,
           textColor: Theme.of(context).colorScheme.onSurface,
         );
+      case ChatRole.system:
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+          child: Text(
+            item.text,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Theme.of(context).hintColor,
+              fontStyle: FontStyle.italic,
+              fontSize: 12,
+            ),
+          ),
+        );
       case ChatRole.error:
         return _Bubble(
           text: item.text,
@@ -394,7 +513,11 @@ class _ChatItemView extends StatelessWidget {
           textColor: Theme.of(context).colorScheme.onErrorContainer,
         );
       case ChatRole.recalled:
-        return _RecalledSection(memories: item.recalled);
+        return _RecalledSection(
+          memories: item.recalled,
+          scores: item.scores,
+          rerankedByJina: item.rerankedByJina,
+        );
     }
   }
 }
@@ -435,9 +558,20 @@ class _Bubble extends StatelessWidget {
 
 /// The "🧠 recalled" section listing retrieved memories (shown above the reply).
 class _RecalledSection extends StatelessWidget {
-  const _RecalledSection({required this.memories});
+  const _RecalledSection({
+    required this.memories,
+    required this.scores,
+    required this.rerankedByJina,
+  });
 
   final List<RecalledMemory> memories;
+
+  /// Score to show per memory (parallel to [memories]): Jina relevance when
+  /// [rerankedByJina], otherwise the semantic score.
+  final List<double?> scores;
+
+  /// Whether [memories] were reordered by the Jina reranker.
+  final bool rerankedByJina;
 
   @override
   Widget build(BuildContext context) {
@@ -468,7 +602,7 @@ class _RecalledSection extends StatelessWidget {
               padding: const EdgeInsets.only(bottom: 6),
               child: Text(
                 '🧠 recalled ${memories.length} '
-                '${memories.length == 1 ? "memory" : "memories"}',
+                '${rerankedByJina ? "(reranked by Jina)" : "(semantic)"}',
                 style: TextStyle(
                   color: Theme.of(context).hintColor,
                   fontSize: 12,
@@ -480,15 +614,13 @@ class _RecalledSection extends StatelessWidget {
               spacing: 6,
               runSpacing: 6,
               children: [
-                for (final m in memories)
+                for (var i = 0; i < memories.length; i++)
                   Chip(
                     visualDensity: VisualDensity.compact,
                     materialTapTargetSize:
                         MaterialTapTargetSize.shrinkWrap,
                     label: Text(
-                      m.score != null
-                          ? '${m.content}  (${m.score!.toStringAsFixed(2)})'
-                          : m.content,
+                      _label(memories[i], i < scores.length ? scores[i] : null),
                       style: const TextStyle(fontSize: 12),
                     ),
                   ),
@@ -499,4 +631,8 @@ class _RecalledSection extends StatelessWidget {
       ),
     );
   }
+
+  String _label(RecalledMemory m, double? score) => score != null
+      ? '${m.content}  (${score.toStringAsFixed(2)})'
+      : m.content;
 }
