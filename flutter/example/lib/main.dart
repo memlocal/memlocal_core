@@ -13,10 +13,23 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       home: Scaffold(
-        appBar: AppBar(title: const Text('flutter_rust_bridge quickstart')),
+        appBar: AppBar(title: const Text('memlocal quickstart')),
         body: Center(
-          child: Text(
-            'Action: Call Rust `greet("Tom")`\nResult: `${greet(name: "Tom")}`',
+          child: FutureBuilder<int>(
+            future: Memlocal.openInMemory(dimensions: 1536)
+                .then((m) => m.memoryCount()),
+            builder: (context, snapshot) {
+              if (snapshot.hasError) {
+                return Text('Error: ${snapshot.error}');
+              }
+              if (!snapshot.hasData) {
+                return const CircularProgressIndicator();
+              }
+              return Text(
+                'Action: open in-memory engine + count\n'
+                'Result: `${snapshot.data}`',
+              );
+            },
           ),
         ),
       ),

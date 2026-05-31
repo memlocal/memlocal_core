@@ -6,6 +6,7 @@ void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
   setUpAll(() async => await RustLib.init());
   test('Can call rust function', () async {
-    expect(greet(name: "Tom"), "Hello, Tom!");
+    final memlocal = await Memlocal.openInMemory(dimensions: 1536);
+    expect(await memlocal.memoryCount(), 0);
   });
 }
