@@ -251,7 +251,7 @@ Phase 0 is strictly sequential (it discovers the build/threading unknowns). Phas
 | Sync-trait → async-Dart callback bridge deadlock/threading | High | Phase 0 dedicated bridge test; block only FRB worker threads; document the invariant |
 | FRB 2.11.1 codegen quirks vs engine types | Med | Pin FRB version; mirror only stable types, JSON for the rest |
 | Binary size with CozoDB | Med | No `http`/reqwest in the lib; `opt-level="z"` + LTO already set in core |
-| iOS min version / NDK minSdk specifics | Med | Pin and document during Phase 0 (candidate: iOS 13+, Android minSdk 23+) |
+| iOS min version / NDK minSdk specifics | Med | Resolved in Phase 0: Android Flutter-default minSdk + NDK r28c OK; iOS example 13.0 (align podspec). See `PHASE0_NOTES.md` |
 | Reranker is a separate service + key (Jina) | Low | Reranking optional (pipeline runs without it); free tier; pluggable for other rerankers |
 | Publish-time path→git dep drift | Low | Helper script + `--dry-run` gate in CI |
 
@@ -259,5 +259,5 @@ Phase 0 is strictly sequential (it discovers the build/threading unknowns). Phas
 
 1. ~~Reranker default~~ — **Decided (Option A):** ship `JinaReranker` (`jina-reranker-v2-base-multilingual`), mirroring core; OpenAI for embeddings + LLM. Needs a Jina API key (free tier).
 2. ~~Default OpenAI LLM model~~ — **Decided:** `gpt-5.4-nano` ([docs](https://developers.openai.com/api/docs/models/gpt-5.4-nano)), configurable. To confirm during Phase 3: exact API surface (Chat Completions vs Responses API) and structured-output/JSON mode for the extraction call. (Embeddings remain `text-embedding-3-small`.)
-3. Minimum platform versions (iOS / Android `minSdk`) — to pin in Phase 0.
+3. ~~Minimum platform versions~~ — **Resolved (Phase 0, compile-verified):** Android builds with the Flutter default `minSdk` (no override needed) on NDK r28c (28.2.13676358); iOS example targets 13.0 (align `memlocal.podspec` from 11.0 → 13.0 in Phase 1/5). Runtime-confirmed minimums pending on-device verification (deferred — see `PHASE0_NOTES.md`).
 4. License file: Apache-2.0 to match core — assumed.

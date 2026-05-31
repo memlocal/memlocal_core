@@ -230,16 +230,7 @@ mod api;
 mod frb_generated;
 ```
 
-- [ ] **Step 3: Run the host unit test to verify it passes**
-
-Run from `flutter/rust`:
-```bash
-cargo test opens_in_memory_and_counts_zero -- --nocapture
-```
-Expected: `test api::skeleton::tests::opens_in_memory_and_counts_zero ... ok`.
-**Discovery checkpoint:** a compile error like "`Memlocal` cannot be sent between threads safely" means the engine isn't `Send + Sync`; if so, record it in PHASE0_NOTES and wrap shared state accordingly (e.g., confirm `cozo::DbInstance` is `Send + Sync`) before proceeding.
-
-- [ ] **Step 4: Verify the codegen config points at our api module**
+- [ ] **Step 3: Verify the codegen config points at our api module**
 
 Open `flutter/flutter_rust_bridge.yaml`. Confirm (and fix if the template differs):
 ```yaml
@@ -248,13 +239,24 @@ rust_root: rust/
 dart_output: lib/src/rust
 ```
 
-- [ ] **Step 5: Generate the Dart bindings**
+- [ ] **Step 4: Generate the Dart bindings**
 
 Run from `flutter/`:
 ```bash
 flutter_rust_bridge_codegen generate
 ```
 Expected: regenerates `rust/src/frb_generated.rs` and `lib/src/rust/…`, including a Dart `Memlocal` class with static `openInMemory({required int dimensions})` and method `memoryCount()`. No errors.
+
+> **Ordering note (corrected after execution):** codegen MUST run before the host test below. `frb_generated.rs` is compiled as part of the crate, so after swapping the template's module tree (Step 2) the stale generated bindings still reference the old `simple` module and break `cargo build`/`cargo test` until regenerated.
+
+- [ ] **Step 5: Run the host unit test to verify it passes**
+
+Run from `flutter/rust`:
+```bash
+cargo test opens_in_memory_and_counts_zero -- --nocapture
+```
+Expected: `test api::skeleton::tests::opens_in_memory_and_counts_zero ... ok`.
+**Discovery checkpoint:** a compile error like "`Memlocal` cannot be sent between threads safely" means the engine isn't `Send + Sync`; if so, record it in PHASE0_NOTES and wrap shared state accordingly (e.g., confirm `cozo::DbInstance` is `Send + Sync`) before proceeding.
 
 - [ ] **Step 6: Static-analyze the generated Dart**
 
