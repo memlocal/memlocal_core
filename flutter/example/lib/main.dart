@@ -1,15 +1,24 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:memlocal/memlocal.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
-const _apiKeyPref = 'openai_api_key';
-const _jinaKeyPref = 'jina_api_key';
 const _dimensions = 1536;
+
+/// Reads a key from the loaded `.env`, treating empty/whitespace as absent.
+String? _envKey(String name) {
+  final v = dotenv.maybeGet(name)?.trim();
+  return (v == null || v.isEmpty) ? null : v;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (_) {
+    // .env missing or unreadable — keys will be absent; the UI will prompt.
+  }
   runApp(const MemoryChatApp());
 }
 
@@ -84,8 +93,6 @@ class _ChatScreenState extends State<ChatScreen> {
   final List<ChatItem> _items = [];
 
   Memlocal? _engine;
-  String? _apiKey;
-  String? _jinaKey;
   EmbeddingProvider? _embeddingProvider;
   LlmProvider? _llmProvider;
   RerankerProvider? _reranker;
@@ -117,15 +124,21 @@ class _ChatScreenState extends State<ChatScreen> {
         dbPath: '${dir.path}/memlocal_demo.db',
         dimensions: _dimensions,
       );
-      final prefs = await SharedPreferences.getInstance();
-      final key = prefs.getString(_apiKeyPref);
-      final jinaKey = prefs.getString(_jinaKeyPref);
+      // Keys come solely from the `.env` file (see flutter/example/.env).
+      final apiKey = _envKey('OPENAI_API_KEY');
+      final jinaKey = _envKey('JINA_API_KEY');
       if (!mounted) return;
       setState(() {
         _engine = engine;
         _initializing = false;
-        _applyKey(key);
-        _applyJinaKey(jinaKey);
+        if (apiKey != null) {
+          _embeddingProvider = OpenAIEmbeddingProvider(apiKey);
+          _llmProvider = OpenAILlmProvider(apiKey);
+        }
+        // Jina is optional: when absent, retrieval stays semantic-only.
+        if (jinaKey != null) {
+          _reranker = JinaReranker(jinaKey);
+        }
       });
     } catch (e) {
       if (!mounted) return;
@@ -134,105 +147,6 @@ class _ChatScreenState extends State<ChatScreen> {
         _initError = '$e';
       });
     }
-  }
-
-  /// Builds (or clears) the OpenAI providers from a key. Call inside setState.
-  void _applyKey(String? key) {
-    final trimmed = key?.trim();
-    if (trimmed == null || trimmed.isEmpty) {
-      _apiKey = null;
-      _embeddingProvider = null;
-      _llmProvider = null;
-      return;
-    }
-    _apiKey = trimmed;
-    _embeddingProvider = OpenAIEmbeddingProvider(trimmed);
-    _llmProvider = OpenAILlmProvider(trimmed);
-  }
-
-  /// Builds (or clears) the optional Jina reranker from a key. Call inside
-  /// setState. When absent, [_reranker] stays null and the chat falls back to
-  /// plain semantic top-5.
-  void _applyJinaKey(String? key) {
-    final trimmed = key?.trim();
-    if (trimmed == null || trimmed.isEmpty) {
-      _jinaKey = null;
-      _reranker = null;
-      return;
-    }
-    _jinaKey = trimmed;
-    _reranker = JinaReranker(trimmed);
-  }
-
-  Future<void> _openSettings() async {
-    final openAiController = TextEditingController(text: _apiKey ?? '');
-    final jinaController = TextEditingController(text: _jinaKey ?? '');
-    final saved = await showDialog<({String openAi, String jina})>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Settings'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: openAiController,
-              obscureText: true,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'OpenAI API key',
-                hintText: 'sk-...',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: jinaController,
-              obscureText: true,
-              decoration: const InputDecoration(
-                labelText: 'Jina API key (optional — enables reranking)',
-                hintText: 'jina_...',
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(
-              ctx,
-              (openAi: openAiController.text, jina: jinaController.text),
-            ),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-    openAiController.dispose();
-    jinaController.dispose();
-    if (saved == null) return; // dialog cancelled
-
-    final prefs = await SharedPreferences.getInstance();
-    final openAi = saved.openAi.trim();
-    if (openAi.isEmpty) {
-      await prefs.remove(_apiKeyPref);
-    } else {
-      await prefs.setString(_apiKeyPref, openAi);
-    }
-    final jina = saved.jina.trim();
-    if (jina.isEmpty) {
-      await prefs.remove(_jinaKeyPref);
-    } else {
-      await prefs.setString(_jinaKeyPref, jina);
-    }
-    if (!mounted) return;
-    setState(() {
-      _applyKey(openAi);
-      _applyJinaKey(jina);
-    });
   }
 
   void _scrollToBottom() {
@@ -337,13 +251,6 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('memlocal chat'),
-        actions: [
-          IconButton(
-            tooltip: 'Settings',
-            icon: const Icon(Icons.settings),
-            onPressed: _initializing ? null : _openSettings,
-          ),
-        ],
       ),
       body: _buildBody(),
     );
@@ -366,7 +273,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     return Column(
       children: [
-        if (!_ready) _ApiKeyBanner(onTap: _openSettings),
+        if (!_ready) const _ApiKeyBanner(),
         Expanded(child: _buildTranscript()),
         if (_sending) const LinearProgressIndicator(minHeight: 2),
         _buildComposer(),
@@ -382,7 +289,7 @@ class _ChatScreenState extends State<ChatScreen> {
           child: Text(
             _ready
                 ? 'Say hello — every message becomes a memory.'
-                : 'Add your OpenAI API key to start.',
+                : 'Set OPENAI_API_KEY in flutter/example/.env and restart the app.',
             textAlign: TextAlign.center,
             style: TextStyle(color: Theme.of(context).hintColor),
           ),
@@ -415,8 +322,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 textInputAction: TextInputAction.newline,
                 keyboardType: TextInputType.multiline,
                 decoration: InputDecoration(
-                  hintText:
-                      _ready ? 'Message' : 'Add an API key to start…',
+                  hintText: _ready
+                      ? 'Message'
+                      : 'Set OPENAI_API_KEY in .env to start…',
                   border: const OutlineInputBorder(),
                   isDense: true,
                 ),
@@ -435,34 +343,29 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 }
 
-/// Inline banner shown when no API key is configured.
+/// Inline banner shown when no OpenAI API key is configured. Keys come solely
+/// from `flutter/example/.env`, so this is informational (not tappable).
 class _ApiKeyBanner extends StatelessWidget {
-  const _ApiKeyBanner({required this.onTap});
-
-  final VoidCallback onTap;
+  const _ApiKeyBanner();
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Material(
       color: scheme.secondaryContainer,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          child: Row(
-            children: [
-              Icon(Icons.key, color: scheme.onSecondaryContainer),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  'Add your OpenAI API key to start',
-                  style: TextStyle(color: scheme.onSecondaryContainer),
-                ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Icon(Icons.key, color: scheme.onSecondaryContainer),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'Set OPENAI_API_KEY in flutter/example/.env and restart the app.',
+                style: TextStyle(color: scheme.onSecondaryContainer),
               ),
-              Icon(Icons.chevron_right, color: scheme.onSecondaryContainer),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
