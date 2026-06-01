@@ -1,9 +1,26 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:memlocal/memlocal.dart';
 import 'package:path_provider/path_provider.dart';
 
 const _dimensions = 1536;
+
+/// System prompt for the LLM extraction step: decides what is worth storing,
+/// splits into atomic memories, and classifies each into one of the engine's
+/// 8 memory types. The model must return ONLY a JSON array.
+const _extractionSystemPrompt = '''
+You extract durable, atomic memories from a user's message for a long-term memory system.
+Return ONLY a JSON array (no prose, no markdown fences). Each element must be:
+{"content": "<one atomic fact, written in third person, self-contained>", "type": "<one of: episodic, factual, semantic, procedural, social, spatial, prospective, affective>"}
+
+Rules:
+- One fact per element. Preserve proper nouns exactly.
+- Only include information worth remembering long-term. Greetings, small talk, acknowledgements, and pure questions contain nothing to remember -> return [].
+- Pick the best type: episodic=events/experiences; factual=stable personal facts/preferences; semantic=general knowledge; procedural=how-to/workflows; social=people/relationships; spatial=places/locations; prospective=reminders/future intentions; affective=feelings/emotions.
+Return [] when nothing is worth storing.
+''';
 
 /// Reads a key from the loaded `.env`, treating empty/whitespace as absent.
 String? _envKey(String name) {
@@ -37,7 +54,7 @@ class MemoryChatApp extends StatelessWidget {
 }
 
 /// The kind of item rendered in the transcript.
-enum ChatRole { user, recalled, assistant, system, error }
+enum ChatRole { user, recalled, stored, assistant, system, error }
 
 /// One renderable entry in the chat transcript.
 class ChatItem {
@@ -45,28 +62,39 @@ class ChatItem {
       : role = ChatRole.user,
         recalled = const [],
         scores = const [],
-        rerankedByJina = false;
+        rerankedByJina = false,
+        stored = const [];
   ChatItem.assistant(this.text)
       : role = ChatRole.assistant,
         recalled = const [],
         scores = const [],
-        rerankedByJina = false;
+        rerankedByJina = false,
+        stored = const [];
   ChatItem.system(this.text)
       : role = ChatRole.system,
         recalled = const [],
         scores = const [],
-        rerankedByJina = false;
+        rerankedByJina = false,
+        stored = const [];
   ChatItem.error(this.text)
       : role = ChatRole.error,
         recalled = const [],
         scores = const [],
-        rerankedByJina = false;
+        rerankedByJina = false,
+        stored = const [];
   ChatItem.recalled(
     this.recalled, {
     required this.scores,
     required this.rerankedByJina,
   })  : role = ChatRole.recalled,
-        text = '';
+        text = '',
+        stored = const [];
+  ChatItem.stored(this.stored)
+      : role = ChatRole.stored,
+        text = '',
+        recalled = const [],
+        scores = const [],
+        rerankedByJina = false;
 
   final ChatRole role;
   final String text;
@@ -78,6 +106,10 @@ class ChatItem {
 
   /// Whether [recalled] was reordered by the Jina reranker (vs. semantic order).
   final bool rerankedByJina;
+
+  /// The (content, type) memories extracted and stored for this turn. Empty
+  /// means nothing was worth storing (chit-chat).
+  final List<({String content, String type})> stored;
 }
 
 class ChatScreen extends StatefulWidget {
@@ -212,8 +244,28 @@ class _ChatScreenState extends State<ChatScreen> {
         rerankedByJina = false;
       }
 
-      // d. Store the current message for future turns.
-      await engine.addMemory(content: text, embedding: embedding);
+      // d. Store step: run an LLM extraction over the message to decide what's
+      //    worth keeping, split it into atomic memories, and classify each into
+      //    one of the engine's memory types. Embeddings for stored items are
+      //    computed from each extracted memory's own content (the RAW message
+      //    embedding above is only the retrieval query, and is unchanged).
+      List<({String content, String type})> stored = [];
+      String? storeNote;
+      try {
+        final extracted = await _extractMemories(text);
+        for (final m in extracted) {
+          final emb = await embeddingProvider.embedOne(m.content);
+          await engine.addMemory(content: m.content, kind: m.type, embedding: emb);
+        }
+        stored = extracted;
+      } catch (e) {
+        // Extraction failed -> don't lose the message: store it verbatim as factual.
+        final emb = await embeddingProvider.embedOne(text);
+        await engine.addMemory(content: text, kind: 'factual', embedding: emb);
+        stored = [(content: text, type: 'factual')];
+        storeNote = 'extraction failed (${e.toString()}); stored raw as factual';
+      }
+
       // e. Build the memory-grounded system prompt + single LLM call.
       final system =
           'You are a helpful assistant with long-term memory of this user. '
@@ -222,7 +274,7 @@ class _ChatScreenState extends State<ChatScreen> {
           '\nUse them when relevant; if none apply, just answer normally.';
       final reply = await llmProvider.complete(system, text);
 
-      // f. Show recalled context, then the assistant reply.
+      // f. Show recalled context, then what was stored, then the assistant reply.
       if (!mounted) return;
       setState(() {
         _items.add(ChatItem.recalled(
@@ -231,6 +283,8 @@ class _ChatScreenState extends State<ChatScreen> {
           rerankedByJina: rerankedByJina,
         ));
         if (rerankNote != null) _items.add(ChatItem.system(rerankNote));
+        _items.add(ChatItem.stored(stored));
+        if (storeNote != null) _items.add(ChatItem.system(storeNote));
         _items.add(ChatItem.assistant(reply));
         _sending = false;
       });
@@ -244,6 +298,53 @@ class _ChatScreenState extends State<ChatScreen> {
       });
       _scrollToBottom();
     }
+  }
+
+  /// Runs the LLM extraction step over [text]: asks the model what is worth
+  /// remembering, split into atomic memories and classified by type. Returns
+  /// the extracted (content, type) pairs (possibly empty — e.g. for chit-chat).
+  ///
+  /// Parses the model output robustly (tolerating ```json fences and prose
+  /// around the array). RETHROWS on any parse failure so the caller can fall
+  /// back to storing the raw message.
+  Future<List<({String content, String type})>> _extractMemories(
+    String text,
+  ) async {
+    final llmProvider = _llmProvider!;
+    final raw = await llmProvider.complete(_extractionSystemPrompt, text);
+
+    // Strip whitespace and any markdown code fences the model may have added.
+    var cleaned = raw.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replaceFirst(RegExp(r'^```(?:json)?'), '');
+      if (cleaned.endsWith('```')) {
+        cleaned = cleaned.substring(0, cleaned.length - 3);
+      }
+      cleaned = cleaned.trim();
+    }
+    // Take the substring from the first '[' to the last ']'.
+    final start = cleaned.indexOf('[');
+    final end = cleaned.lastIndexOf(']');
+    if (start == -1 || end == -1 || end < start) {
+      throw FormatException('no JSON array in model output: $raw');
+    }
+    final decoded = jsonDecode(cleaned.substring(start, end + 1));
+    if (decoded is! List) {
+      throw const FormatException('extraction output was not a JSON array');
+    }
+
+    final out = <({String content, String type})>[];
+    for (final element in decoded) {
+      if (element is! Map) continue;
+      final content = (element['content'] as String?)?.trim() ?? '';
+      // Allowed types are the 8 documented ones; pass others through anyway
+      // (the Rust side defaults unknown stored-names to semantic).
+      final type =
+          (element['type'] as String?)?.trim().toLowerCase() ?? 'semantic';
+      if (content.isEmpty) continue;
+      out.add((content: content, type: type));
+    }
+    return out;
   }
 
   @override
@@ -421,6 +522,8 @@ class _ChatItemView extends StatelessWidget {
           scores: item.scores,
           rerankedByJina: item.rerankedByJina,
         );
+      case ChatRole.stored:
+        return _StoredSection(stored: item.stored);
     }
   }
 }
@@ -536,6 +639,83 @@ class _RecalledSection extends StatelessWidget {
   }
 
   String _label(RecalledMemory m, double? score) => score != null
-      ? '${m.content}  (${score.toStringAsFixed(2)})'
-      : m.content;
+      ? '[${m.kind}] ${m.content}  (${score.toStringAsFixed(2)})'
+      : '[${m.kind}] ${m.content}';
+}
+
+/// The "💾 stored" section showing what the extraction step decided to persist
+/// for this turn — one chip per atomic memory as `[<type>] <content>`. When the
+/// list is empty, the message was deemed chit-chat and nothing was stored.
+///
+/// Rendered distinctly from the 🧠 recalled section (tinted chips) so the
+/// classification and selectivity are visible at a glance.
+class _StoredSection extends StatelessWidget {
+  const _StoredSection({required this.stored});
+
+  final List<({String content, String type})> stored;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+
+    if (stored.isEmpty) {
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 2, 16, 2),
+          child: Text(
+            '💾 nothing worth storing',
+            style: TextStyle(
+              color: Theme.of(context).hintColor,
+              fontStyle: FontStyle.italic,
+              fontSize: 12,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: Text(
+                '💾 stored ${stored.length}',
+                style: TextStyle(
+                  color: Theme.of(context).hintColor,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final m in stored)
+                  Chip(
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    backgroundColor: scheme.tertiaryContainer,
+                    side: BorderSide(color: scheme.tertiary.withValues(alpha: 0.4)),
+                    label: Text(
+                      '[${m.type}] ${m.content}',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: scheme.onTertiaryContainer,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
