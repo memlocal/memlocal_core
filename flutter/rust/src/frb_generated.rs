@@ -72,6 +72,7 @@ fn wire__crate__api__skeleton__Memlocal_add_memory_impl(
                 flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Memlocal>,
             >>::sse_decode(&mut deserializer);
             let api_content = <String>::sse_decode(&mut deserializer);
+            let api_kind = <String>::sse_decode(&mut deserializer);
             let api_embedding = <Vec<f32>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
@@ -93,6 +94,7 @@ fn wire__crate__api__skeleton__Memlocal_add_memory_impl(
                     let output_ok = crate::api::skeleton::Memlocal::add_memory(
                         &*api_that_guard,
                         api_content,
+                        api_kind,
                         api_embedding,
                     )?;
                     Ok(output_ok)

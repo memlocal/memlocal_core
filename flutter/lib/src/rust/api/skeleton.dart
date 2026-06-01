@@ -18,9 +18,11 @@ Future<int> callDartClosure({
 
 // Rust type: RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<Memlocal>>
 abstract class Memlocal implements RustOpaqueInterface {
-  /// Store `content` as a Factual memory using a caller-supplied embedding. Returns the new id.
+  /// Store `content` as a memory of the given type (stored-name string, e.g. "factual",
+  /// "episodic", "spatial", ...) using a caller-supplied embedding. Returns the new id.
   Future<String> addMemory({
     required String content,
+    required String kind,
     required List<double> embedding,
   });
 

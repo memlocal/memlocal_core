@@ -78,6 +78,7 @@ abstract class RustLibApi extends BaseApi {
   Future<String> crateApiSkeletonMemlocalAddMemory({
     required Memlocal that,
     required String content,
+    required String kind,
     required List<double> embedding,
   });
 
@@ -124,6 +125,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Future<String> crateApiSkeletonMemlocalAddMemory({
     required Memlocal that,
     required String content,
+    required String kind,
     required List<double> embedding,
   }) {
     return handler.executeNormal(
@@ -135,6 +137,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
             serializer,
           );
           sse_encode_String(content, serializer);
+          sse_encode_String(kind, serializer);
           sse_encode_list_prim_f_32_loose(embedding, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
@@ -148,7 +151,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_String,
         ),
         constMeta: kCrateApiSkeletonMemlocalAddMemoryConstMeta,
-        argValues: [that, content, embedding],
+        argValues: [that, content, kind, embedding],
         apiImpl: this,
       ),
     );
@@ -157,7 +160,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSkeletonMemlocalAddMemoryConstMeta =>
       const TaskConstMeta(
         debugName: "Memlocal_add_memory",
-        argNames: ["that", "content", "embedding"],
+        argNames: ["that", "content", "kind", "embedding"],
       );
 
   @override
@@ -938,13 +941,16 @@ class MemlocalImpl extends RustOpaque implements Memlocal {
         RustLib.instance.api.rust_arc_decrement_strong_count_MemlocalPtr,
   );
 
-  /// Store `content` as a Factual memory using a caller-supplied embedding. Returns the new id.
+  /// Store `content` as a memory of the given type (stored-name string, e.g. "factual",
+  /// "episodic", "spatial", ...) using a caller-supplied embedding. Returns the new id.
   Future<String> addMemory({
     required String content,
+    required String kind,
     required List<double> embedding,
   }) => RustLib.instance.api.crateApiSkeletonMemlocalAddMemory(
     that: this,
     content: content,
+    kind: kind,
     embedding: embedding,
   );
 

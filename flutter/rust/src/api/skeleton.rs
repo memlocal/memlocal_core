@@ -47,9 +47,16 @@ impl Memlocal {
         Ok(Memlocal { engine: Arc::new(engine) })
     }
 
-    /// Store `content` as a Factual memory using a caller-supplied embedding. Returns the new id.
-    pub fn add_memory(&self, content: String, embedding: Vec<f32>) -> Result<String, String> {
-        let item = MemoryItem::new(content, MemoryType::Factual);
+    /// Store `content` as a memory of the given type (stored-name string, e.g. "factual",
+    /// "episodic", "spatial", ...) using a caller-supplied embedding. Returns the new id.
+    pub fn add_memory(
+        &self,
+        content: String,
+        kind: String,
+        embedding: Vec<f32>,
+    ) -> Result<String, String> {
+        let memory_type = MemoryType::from_stored_name(&kind);
+        let item = MemoryItem::new(content, memory_type);
         self.engine
             .put_memory(&item, &embedding)
             .map_err(|e| e.to_string())?;
@@ -107,7 +114,7 @@ mod tests {
     fn add_then_search_roundtrip() {
         let m = Memlocal::open_in_memory(8).expect("engine opens");
         let emb = vec![0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
-        let id = m.add_memory("hello world".to_string(), emb.clone()).expect("add");
+        let id = m.add_memory("hello world".to_string(), "factual".to_string(), emb.clone()).expect("add");
         assert!(!id.is_empty());
         let hits = m.search_semantic(emb, 5).expect("search");
         assert_eq!(hits.len(), 1);
