@@ -1,0 +1,15 @@
+# Files to exclude from the published pub.dev archive.
+# (lib/, rust/ source, cargokit/, android/, ios/, example/, and the
+#  README/CHANGELOG/LICENSE/pubspec are intentionally INCLUDED.)
+
+# The example app's lockfile — not needed by consumers and just bloat.
+example/pubspec.lock
+
+# Never ship secrets or local build output (defensive; also gitignored).
+.env
+example/.env
+**/build/
+**/.dart_tool/
+**/target/
+.flutter-plugins-dependencies
+example/.flutter-plugins-dependencies

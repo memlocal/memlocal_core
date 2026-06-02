@@ -4,14 +4,21 @@ import 'reranker_provider.dart';
 
 /// [RerankerProvider] backed by the Jina AI rerank API (mirrors memlocal_core).
 class JinaReranker implements RerankerProvider {
+  /// Creates a reranker that calls the Jina AI rerank API with [apiKey], using
+  /// [model]. [baseUrl] can point at a compatible endpoint.
   JinaReranker(
     this.apiKey, {
     this.model = 'jina-reranker-v2-base-multilingual',
     this.baseUrl = 'https://api.jina.ai/v1',
   });
 
+  /// Jina API key sent as a bearer token. The caller owns this secret.
   final String apiKey;
+
+  /// The Jina reranker model to use.
   final String model;
+
+  /// Base URL of the (Jina-compatible) rerank API.
   final String baseUrl;
 
   @override

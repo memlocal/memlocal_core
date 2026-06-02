@@ -4,7 +4,7 @@
     <strong>Local-first cognitive memory engine for AI agents</strong>
   </p>
   <p align="center">
-    <a href="https://memlocal.dev">Website</a> · <a href="https://github.com/memlocal/memlocal_core">GitHub</a> · <a href="https://github.com/memlocal/memlocal_dart">Flutter SDK</a>
+    <a href="https://memlocal.dev">Website</a> · <a href="https://github.com/memlocal/memlocal_core">GitHub</a> · <a href="https://pub.dev/packages/memlocal">Flutter SDK</a>
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/language-Rust-orange" alt="Rust" />
@@ -330,11 +330,11 @@ Evaluated on the **LoCoMo** (Long Conversation Memory) benchmark.
 
 ### Overall Results
 
-| Metric                | Value              |
-| --------------------- | ------------------ |
-| **Pass rate (≥3/5)**  | **80.0%**          |
-| **Average LLM score** | **4.21/5**         |
-| Average keyword F1    | 0.146              |
+| Metric                | Value      |
+| --------------------- | ---------- |
+| **Pass rate (≥3/5)**  | **80.0%**  |
+| **Average LLM score** | **4.21/5** |
+| Average keyword F1    | 0.146      |
 
 ### Per-Category Breakdown
 
@@ -719,11 +719,26 @@ This design means switching between cloud and local inference is a configuration
 
 ---
 
+## memlocal for Flutter
+
+There is now a published **Flutter/Dart package** for memlocal, living in this
+repo under [`flutter/`](flutter/) (pub name: **`memlocal`**). It's the Flutter
+binding to this engine: it compiles the Rust core from source via
+`flutter_rust_bridge` + cargokit and exposes it to Dart, so a Flutter app can
+open a persistent or in-memory engine, store typed memories, and run semantic
+search entirely on-device — plus bring-your-own embedding/LLM/reranker providers
+with OpenAI and Jina implementations included.
+
+- Package docs: [`flutter/README.md`](flutter/README.md)
+- pub.dev: <https://pub.dev/packages/memlocal>
+
+---
+
 ## Platform SDKs
 
 | Platform             | SDK                                                        | Status       |
 | -------------------- | ---------------------------------------------------------- | ------------ |
-| **Flutter/Dart**     | [memlocal_dart](https://github.com/memlocal/memlocal_dart) | ✅ Available |
+| **Flutter/Dart**     | [memlocal](https://pub.dev/packages/memlocal) (this repo's [`flutter/`](flutter/)) | ✅ Available |
 | **Kotlin (Android)** | memlocal-android                                           | 🔜 Planned   |
 | **Swift (iOS)**      | memlocal-swift                                             | 🔜 Planned   |
 | **Python**           | memlocal-py                                                | 🔜 Planned   |
