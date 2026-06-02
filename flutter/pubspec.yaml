@@ -2,8 +2,8 @@ name: memlocal
 description: "Local-first, on-device cognitive memory for AI apps — a Flutter binding to the Rust memlocal engine (CozoDB) with pluggable OpenAI + Jina providers."
 version: 0.1.0
 homepage: https://memlocal.dev
-repository: https://github.com/Sirsho29/memlocal_core
-issue_tracker: https://github.com/Sirsho29/memlocal_core/issues
+repository: https://github.com/memlocal/memlocal_core
+issue_tracker: https://github.com/memlocal/memlocal_core/issues
 topics:
   - ai
   - memory

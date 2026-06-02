@@ -10,7 +10,7 @@ engine from source and exposes it to Dart over
 Flutter app can store and recall memories without a backend.
 
 - Website: <https://memlocal.dev>
-- Core engine: <https://github.com/Sirsho29/memlocal_core>
+- Core engine: <https://github.com/memlocal/memlocal_core>
 
 ## Why memlocal
 
@@ -29,7 +29,7 @@ leaving their device. `memlocal` takes the opposite approach:
 
 As a credibility signal: on the **LoCoMo** (Long Conversation Memory) benchmark
 the core engine reaches an **80% pass rate** (see the numbers and methodology at
-<https://memlocal.dev> and in the [core repo](https://github.com/Sirsho29/memlocal_core)).
+<https://memlocal.dev> and in the [core repo](https://github.com/memlocal/memlocal_core)).
 
 ## Features
 
@@ -54,7 +54,7 @@ ingestion, automatic context assembly, deduplication, multi-channel retrieval,
 etc.) live in the Rust core and are **not yet** exposed through this binding —
 this package currently provides open / store / semantic-search plus the Dart
 providers. See the roadmap in the
-[core repo](https://github.com/Sirsho29/memlocal_core) for what's next.
+[core repo](https://github.com/memlocal/memlocal_core) for what's next.
 
 ## Platform support
 
@@ -200,5 +200,5 @@ run compiles the native engine.
 ## Links
 
 - Website: <https://memlocal.dev>
-- Core engine (Rust): <https://github.com/Sirsho29/memlocal_core>
+- Core engine (Rust): <https://github.com/memlocal/memlocal_core>
 - License: [Apache-2.0](LICENSE)
